@@ -110,7 +110,7 @@ jobs:
             #   proc_dir_entry not found        （被优化掉，需要 --btf_gen_optimized）
             #   FWD (anon) Error emitting BTF   （原型不一致，需要 --skip_encoding_btf_inconsistent_proto）
             PAHOLE_FLAGS=""
-            PV=$(pahole --version | sed -n "s/^v\([0-9]*\)\.\([0-9]*\).*//p")
+            PV=$(pahole --version | sed "s/^v//" | cut -d. -f1,2 | tr -d ".")
             echo "pahole 版本码: $PV"
             if [ -n "$PV" ] && [ "$PV" -ge 121 ]; then PAHOLE_FLAGS="$PAHOLE_FLAGS --btf_gen_floats"; fi
             if [ -n "$PV" ] && [ "$PV" -ge 124 ]; then PAHOLE_FLAGS="$PAHOLE_FLAGS --skip_encoding_btf_enum64"; fi
