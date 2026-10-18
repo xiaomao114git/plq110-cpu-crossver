@@ -1,0 +1,141 @@
+name: build-all-kernels
+
+# 为 5.10 / 5.15 / 6.1 / 6.6 / 6.12 / 6.18 六个 GKI 内核各产出一份 cpuinfo_redirect.ko
+#
+# 为什么必须云端编译：
+#   1. 主机工具（sorttable/objtool）依赖 glibc，Android 和 Windows 上都编不过
+#   2. PROC 后端需要 vmlinux 才能提取 proc_dir_entry 偏移
+#
+# 产物 vermagic 是裸版本号（LOCALVERSION 为空），部署时用
+#   tools/repack-modinfo.py --uname-r '<目标设备 uname -r>'
+# 改成目标设备的完整串，不需要二次编译。
+on:
+  workflow_dispatch:
+    inputs:
+      no_crc:
+        description: '空 __versions 构建（绕开 Module.symvers）'
+        type: boolean
+        default: true
+      keep_debug:
+        description: '保留调试符号（体积大，仅排查用）'
+        type: boolean
+        default: false
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { branch: 'android12-5.10', kernel: '5.10', backend: 'proc' }
+          - { branch: 'android13-5.15', kernel: '5.15', backend: 'proc' }
+          - { branch: 'android14-6.1',  kernel: '6.1',  backend: 'proc' }
+          - { branch: 'android15-6.6',  kernel: '6.6',  backend: 'rvh'  }
+          - { branch: 'android16-6.12', kernel: '6.12', backend: 'proc' }
+          - { branch: 'android17-6.18', kernel: '6.18', backend: 'proc' }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具链
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc flex bison libssl-dev \
+            libelf-dev gcc-aarch64-linux-gnu python3 dwarves
+
+      - name: 缓存内核源码
+        uses: actions/cache@v4
+        with:
+          path: kernel
+          key: gki-${{ matrix.branch }}-v2
+
+      - name: 获取 GKI 源码
+        run: |
+          if [ ! -f kernel/Makefile ]; then
+            rm -rf kernel
+            git clone --depth 1 -b ${{ matrix.branch }} \
+              https://android.googlesource.com/kernel/common kernel
+          fi
+          echo '== 源码版本 =='
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) +=' kernel/Makefile | head -3
+          echo '== 是否有 cpuinfo hook =='
+          ls kernel/include/trace/hooks/cpuinfo.h 2>/dev/null && echo '有' || echo '无'
+
+      - name: 配置内核
+        run: |
+          make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+          ./kernel/scripts/config --file out/.config --set-str LOCALVERSION ''
+          ./kernel/scripts/config --file out/.config -e DEBUG_INFO
+          ./kernel/scripts/config --file out/.config -e DEBUG_INFO_BTF
+
+      - name: 编译内核取 vmlinux
+        run: |
+          set -o pipefail
+          make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+            -j$(nproc) vmlinux 2>&1 | tail -40
+          ls -la out/vmlinux
+
+      - name: 提取 BTF 并生成偏移表
+        run: |
+          if ! objcopy -O binary --only-section=.BTF out/vmlinux btf.bin 2>/dev/null || [ ! -s btf.bin ]; then
+            echo '::error::vmlinux 没有 .BTF 段'; exit 1
+          fi
+          echo "BTF: $(stat -c%s btf.bin) 字节"
+          python3 tools/gen_offsets.py --btf btf.bin --out src/cr_offsets.h
+          echo '== 偏移表 =='
+          cat src/cr_offsets.h
+
+      - name: 编译模块
+        run: |
+          VARS='ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONFIG_MODULE_SIG_ALL=n'
+          if [ '${{ matrix.backend }}' = 'rvh' ]; then
+            echo '后端: RVH'
+          else
+            VARS="$VARS KCFLAGS=-DCR_FORCE_PROC=1"
+            echo '后端: PROC'
+          fi
+          if [ '${{ inputs.keep_debug }}' != 'true' ]; then
+            VARS="$VARS KCFLAGS=-g0"
+          fi
+          if [ '${{ inputs.no_crc }}' = 'true' ] && [ -f out/Module.symvers ]; then
+            mv out/Module.symvers out/Module.symvers.bak
+            VARS="$VARS KBUILD_MODPOST_WARN=1 CONFIG_EXTENDED_MODVERSIONS=n"
+          fi
+          set +e
+          make -C out M=$PWD/src $VARS modules -j$(nproc) 2>&1 | tail -30
+          RC=${PIPESTATUS[0]}
+          if [ -f src/cpuinfo_redirect.mod.c ] && grep -q '__version_ext_names") =$' src/cpuinfo_redirect.mod.c; then
+            echo '修补 .mod.c 空初始化'
+            VLINE=$(grep -n '__version_ext_names") =$' src/cpuinfo_redirect.mod.c | head -1 | cut -d: -f1)
+            head -n "$VLINE" src/cpuinfo_redirect.mod.c > /tmp/m.c
+            printf '\t"";\n' >> /tmp/m.c
+            tail -n +$((VLINE + 2)) src/cpuinfo_redirect.mod.c >> /tmp/m.c
+            mv /tmp/m.c src/cpuinfo_redirect.mod.c
+            touch src/cpuinfo_redirect.mod.c
+            make -C out M=$PWD/src $VARS modules -j$(nproc) 2>&1 | tail -10
+            RC=$?
+          fi
+          [ -f out/Module.symvers.bak ] && mv out/Module.symvers.bak out/Module.symvers
+          ls -la src/*.ko
+          exit $RC
+
+      - name: 校验产物
+        run: |
+          KO=src/cpuinfo_redirect.ko
+          [ -f "$KO" ] || { echo '::error::没有产物'; exit 1; }
+          echo '== vermagic =='
+          strings "$KO" | grep -m1 '^vermagic='
+          echo '== CRC 表 =='
+          if strings "$KO" | grep -q '__versions'; then echo '有'; else echo '无（--no-crc 生效）'; fi
+          echo "大小: $(stat -c%s $KO) 字节"
+          echo "sha256: $(sha256sum $KO | cut -d' ' -f1)"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ko-${{ matrix.kernel }}-${{ matrix.backend }}
+          path: |
+            src/cpuinfo_redirect.ko
+            src/cr_offsets.h
+            btf.bin
+          if-no-files-found: error
