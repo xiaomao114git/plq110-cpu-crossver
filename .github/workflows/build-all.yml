@@ -92,6 +92,22 @@ jobs:
           tail -20 build.log
           ls -la out/vmlinux
 
+      - name: modules_prepare（生成 module.lds 等模块构建文件）
+        run: |
+          # make vmlinux 只编内核，不生成 scripts/module.lds。
+          # 编模块需要它，缺了会报：No rule to make target scripts/module.lds
+          # 注意 modules_prepare 不会生成 Module.symvers（那个要完整构建），
+          # 但这轮用 --no-crc 路径，本来就不需要 CRC 表。
+          make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare 2>&1 | tail -10
+          echo ""
+          echo "=== 关键构建文件 ==="
+          for f in scripts/module.lds include/generated/autoconf.h include/config/auto.conf include/generated/asm-offsets.h; do
+          if [ -f "out/$f" ]; then echo "  OK   $f"; else echo "  MISS $f"; fi
+          done
+          [ -f out/scripts/module.lds ] || { echo "::error::module.lds 仍未生成"; exit 1; }
+          echo ""
+          echo "=== Module.symvers（vmlinux 构建应已产出）==="
+          ls -la out/Module.symvers 2>/dev/null || echo "  (无，--no-crc 路径不依赖它)"
       - name: 校验偏移表前提（不依赖 BTF）
         run: |
           # 实测证据：目标内核 CONFIG_RANDSTRUCT_NONE=y、DEBUG_SPINLOCK 与 DEBUG_LOCK_ALLOC 均未设置
