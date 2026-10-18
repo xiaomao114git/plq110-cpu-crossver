@@ -1,0 +1,25 @@
+# 构建产物（用 CI artifact 分发，不进仓库）
+build/
+dist/
+out-*/
+kernel/
+kernel-*/
+*.ko
+*.mod
+*.mod.c
+*.o
+*.cmd
+*.symvers
+Module.symvers
+
+# 采集包与临时产物
+cr-device-info.tgz
+cr-target-*.tgz
+btf.bin
+
+# 备份与编辑器
+*.bak
+*.orig
+.DS_Store
+Thumbs.db
+.github/workflows/

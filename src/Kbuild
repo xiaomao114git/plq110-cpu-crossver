@@ -1,0 +1,2 @@
+obj-m += cpuinfo_redirect.o
+ccflags-y += -Wno-unused-function
