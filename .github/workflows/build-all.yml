@@ -63,13 +63,16 @@ jobs:
 
       - name: 配置内核
         run: |
-            # gki_defconfig 自带 DEBUG_INFO=y + DWARF4，但不开 DEBUG_INFO_BTF。
-            # DEBUG_INFO_BTF 依赖 PAHOLE_VERSION 构建时探测，探不过就被 olddefconfig 关掉。
-            # 所以不走 Kconfig 那条路，后面直接用 pahole -J 从 vmlinux 生成 .BTF 段。
-            make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- gki_defconfig
+            # 用普通 arm64 defconfig：gki_defconfig 是为 build/build.sh 设计的，
+            # 直接 make 会缺 KMI 符号表等前置，1 分钟就挂。
+            # 只需要 DEBUG_INFO=y —— 后面用 pahole -J 从 DWARF 直接生成 .BTF 段，
+            # 完全不碰 DEBUG_INFO_BTF 那条 Kconfig 依赖链（它依赖 PAHOLE_VERSION 探测）。
+            make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+            ./kernel/scripts/config --file out/.config -d DEBUG_INFO_NONE
+            ./kernel/scripts/config --file out/.config -e DEBUG_INFO -e DEBUG_INFO_DWARF4
             ./kernel/scripts/config --file out/.config --set-str LOCALVERSION ''
             make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-            echo "== DEBUG_INFO 配置（只需 DEBUG_INFO=y，不需要 BTF）=="
+            echo "== DEBUG_INFO 配置 =="
             grep -E "CONFIG_DEBUG_INFO" out/.config | head -8
             grep -q "CONFIG_DEBUG_INFO=y" out/.config || { echo "::error::DEBUG_INFO 未开"; exit 1; }
             echo "== pahole =="
