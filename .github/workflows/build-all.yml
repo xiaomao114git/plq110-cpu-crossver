@@ -28,12 +28,9 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - { branch: 'android12-5.10', kernel: '5.10', backend: 'proc' }
-          - { branch: 'android13-5.15', kernel: '5.15', backend: 'proc' }
+          # 单目标验证阶段：先只在 6.1 上把 BTF 问题解决
+          # 成功后再扩回六版本矩阵（见 PROBE-MODE 注释）
           - { branch: 'android14-6.1',  kernel: '6.1',  backend: 'proc' }
-          - { branch: 'android15-6.6',  kernel: '6.6',  backend: 'rvh'  }
-          - { branch: 'android16-6.12', kernel: '6.12', backend: 'proc' }
-          - { branch: 'android17-6.18', kernel: '6.18', backend: 'proc' }
     steps:
       - uses: actions/checkout@v4
 
@@ -112,6 +109,19 @@ jobs:
             PAHOLE_FLAGS=""
             PV=$(pahole --version | sed "s/^v//" | cut -d. -f1,2 | tr -d ".")
             echo "pahole 版本码: $PV"
+            echo ""
+            echo "===== 阶段0: 布局前提条件 ====="
+            grep -E "CONFIG_DEBUG_SPINLOCK|CONFIG_DEBUG_LOCK_ALLOC|CONFIG_SMP|CONFIG_PREEMPT_RT|CONFIG_RANDSTRUCT" out/.config | tee layout-prereq.txt || echo "(以上均未设置)"
+            echo ""
+            echo "--- spinlock_t 实际大小（从 DWARF 读，不靠推断）---"
+            pahole $PAHOLE_FLAGS -C spinlock_t "$VMLINUX" 2>&1 | head -8 | tee spinlock-size.txt
+            echo ""
+            echo "--- 其它关键结构 ---"
+            for T in raw_spinlock_t list_head proc_dir_entry proc_ops seq_file; do
+              pahole $PAHOLE_FLAGS -C $T "$VMLINUX" 2>/dev/null | head -2 | tee -a layout-sizes.txt
+              echo "---" >> layout-sizes.txt
+            done
+            echo ""
             if [ -n "$PV" ] && [ "$PV" -ge 121 ]; then PAHOLE_FLAGS="$PAHOLE_FLAGS --btf_gen_floats"; fi
             if [ -n "$PV" ] && [ "$PV" -ge 124 ]; then PAHOLE_FLAGS="$PAHOLE_FLAGS --skip_encoding_btf_enum64"; fi
             if [ -n "$PV" ] && [ "$PV" -ge 125 ]; then PAHOLE_FLAGS="$PAHOLE_FLAGS --skip_encoding_btf_inconsistent_proto --btf_gen_optimized"; fi
@@ -207,12 +217,33 @@ jobs:
           echo "大小: $(stat -c%s $KO) 字节"
           echo "sha256: $(sha256sum $KO | cut -d' ' -f1)"
 
-      - name: 上传产物
-        uses: actions/upload-artifact@v4
-        with:
-          name: ko-${{ matrix.kernel }}-${{ matrix.backend }}
-          path: |
-            src/cpuinfo_redirect.ko
-            src/cr_offsets.h
-            btf.bin
-          if-no-files-found: error
+- name: 上传诊断材料（失败也传，供离线分析）
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: diag-${{ matrix.kernel }}
+    path: |
+      vmlinux-full.log
+      out/.config
+      pahole.txt
+      layout-prereq.txt
+      layout-sizes.txt
+      spinlock-size.txt
+      dwarf-pde.txt
+      dwarf-pops.txt
+      btf-detached.log
+      btf-convert.log
+      btf-section.txt
+      btf-verify.txt
+      src/cr_offsets.h
+      src/cpuinfo_redirect.ko
+    if-no-files-found: warn
+
+- name: 上传 vmlinux（供复用，不再重编 25 分钟）
+  if: always()
+  uses: actions/upload-artifact@v4
+  with:
+    name: vmlinux-${{ matrix.kernel }}
+    path: out/vmlinux
+    if-no-files-found: warn
+    compression-level: 0
