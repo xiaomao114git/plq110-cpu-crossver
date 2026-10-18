@@ -30,7 +30,12 @@ jobs:
         include:
           # 单目标验证阶段：先只在 6.1 上把 BTF 问题解决
           # 成功后再扩回六版本矩阵（见 PROBE-MODE 注释）
+          - { branch: 'android12-5.10', kernel: '5.10', backend: 'proc' }
+          - { branch: 'android13-5.15', kernel: '5.15', backend: 'proc' }
           - { branch: 'android14-6.1',  kernel: '6.1',  backend: 'proc' }
+          - { branch: 'android15-6.6',  kernel: '6.6',  backend: 'rvh'  }
+          - { branch: 'android16-6.12', kernel: '6.12', backend: 'proc' }
+          - { branch: 'android17-6.18', kernel: '6.18', backend: 'proc' }
     steps:
       - uses: actions/checkout@v4
 
