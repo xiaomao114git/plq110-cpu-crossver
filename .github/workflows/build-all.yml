@@ -217,33 +217,33 @@ jobs:
           echo "大小: $(stat -c%s $KO) 字节"
           echo "sha256: $(sha256sum $KO | cut -d' ' -f1)"
 
-- name: 上传诊断材料（失败也传，供离线分析）
-  if: always()
-  uses: actions/upload-artifact@v4
-  with:
-    name: diag-${{ matrix.kernel }}
-    path: |
-      vmlinux-full.log
-      out/.config
-      pahole.txt
-      layout-prereq.txt
-      layout-sizes.txt
-      spinlock-size.txt
-      dwarf-pde.txt
-      dwarf-pops.txt
-      btf-detached.log
-      btf-convert.log
-      btf-section.txt
-      btf-verify.txt
-      src/cr_offsets.h
-      src/cpuinfo_redirect.ko
-    if-no-files-found: warn
+      - name: 上传诊断材料（失败也传，供离线分析）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: diag-${{ matrix.kernel }}
+          path: |
+            vmlinux-full.log
+            out/.config
+            pahole.txt
+            layout-prereq.txt
+            layout-sizes.txt
+            spinlock-size.txt
+            dwarf-pde.txt
+            dwarf-pops.txt
+            btf-detached.log
+            btf-convert.log
+            btf-section.txt
+            btf-verify.txt
+            src/cr_offsets.h
+            src/cpuinfo_redirect.ko
+          if-no-files-found: warn
 
-- name: 上传 vmlinux（供复用，不再重编 25 分钟）
-  if: always()
-  uses: actions/upload-artifact@v4
-  with:
-    name: vmlinux-${{ matrix.kernel }}
-    path: out/vmlinux
-    if-no-files-found: warn
-    compression-level: 0
+      - name: 上传 vmlinux（供复用，不再重编 25 分钟）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmlinux-${{ matrix.kernel }}
+          path: out/vmlinux
+          if-no-files-found: warn
+          compression-level: 0
