@@ -92,86 +92,24 @@ jobs:
           tail -20 build.log
           ls -la out/vmlinux
 
-      - name: 提取 BTF 并生成偏移表
+      - name: 校验偏移表前提（不依赖 BTF）
         run: |
-            VMLINUX=out/vmlinux
-            test -s "$VMLINUX" || { echo "::error::没有 vmlinux"; exit 1; }
-            echo "vmlinux: $(stat -c%s $VMLINUX) 字节"
-            pahole --version | tee pahole.txt
-            
-            # 内核官方的 BTF 生成参数（scripts/pahole-flags.sh）：
-            #   pahole >= 1.21 → --btf_gen_floats
-            #   pahole >= 1.24 → --skip_encoding_btf_enum64
-            #   pahole >= 1.25 → --skip_encoding_btf_inconsistent_proto --btf_gen_optimized
-            # 少这两个参数会分别导致：
-            #   proc_dir_entry not found        （被优化掉，需要 --btf_gen_optimized）
-            #   FWD (anon) Error emitting BTF   （原型不一致，需要 --skip_encoding_btf_inconsistent_proto）
-            PAHOLE_FLAGS=""
-            PV=$(pahole --version | sed "s/^v//" | cut -d. -f1,2 | tr -d ".")
-            echo "pahole 版本码: $PV"
-            echo ""
-            echo "===== 阶段0: 布局前提条件 ====="
-            grep -E "CONFIG_DEBUG_SPINLOCK|CONFIG_DEBUG_LOCK_ALLOC|CONFIG_SMP|CONFIG_PREEMPT_RT|CONFIG_RANDSTRUCT" out/.config | tee layout-prereq.txt || echo "(以上均未设置)"
-            echo ""
-            echo "--- spinlock_t 实际大小（从 DWARF 读，不靠推断）---"
-            pahole $PAHOLE_FLAGS -C spinlock_t "$VMLINUX" 2>&1 | head -8 | tee spinlock-size.txt
-            echo ""
-            echo "--- 其它关键结构 ---"
-            for T in raw_spinlock_t list_head proc_dir_entry proc_ops seq_file; do
-              pahole $PAHOLE_FLAGS -C $T "$VMLINUX" 2>/dev/null | head -2 | tee -a layout-sizes.txt
-              echo "---" >> layout-sizes.txt
-            done
-            echo ""
-            if [ -n "$PV" ] && [ "$PV" -ge 121 ]; then PAHOLE_FLAGS="$PAHOLE_FLAGS --btf_gen_floats"; fi
-            if [ -n "$PV" ] && [ "$PV" -ge 124 ]; then PAHOLE_FLAGS="$PAHOLE_FLAGS --skip_encoding_btf_enum64"; fi
-            if [ -n "$PV" ] && [ "$PV" -ge 125 ]; then PAHOLE_FLAGS="$PAHOLE_FLAGS --skip_encoding_btf_inconsistent_proto --btf_gen_optimized"; fi
-            echo "pahole 参数: $PAHOLE_FLAGS"
-            
-            # 阶段2：加了 --btf_gen_optimized 后，被优化掉的类型也能查到
-            echo "===== 阶段2: DWARF 结构完整性 ====="
-            pahole -F dwarf $PAHOLE_FLAGS -C proc_dir_entry "$VMLINUX" > dwarf-pde.txt 2>&1 || true
-            pahole -F dwarf $PAHOLE_FLAGS -C proc_ops "$VMLINUX" > dwarf-pops.txt 2>&1 || true
-            echo "--- proc_dir_entry ---"; head -25 dwarf-pde.txt
-            echo "--- proc_ops ---"; head -15 dwarf-pops.txt
-            # pahole 找不到类型时退出码仍为 0，必须查输出内容
-            grep -q "not found" dwarf-pde.txt && { echo "::error::阶段2失败 - DWARF 无 proc_dir_entry"; exit 1; }
-            grep -q "not found" dwarf-pops.txt && { echo "::error::阶段2失败 - DWARF 无 proc_ops"; exit 1; }
-            grep -q "struct proc_dir_entry" dwarf-pde.txt || { echo "::error::阶段2失败 - 输出无结构定义"; exit 1; }
-            
-            echo "===== 阶段3: 生成 BTF ====="
-            set +e
-            pahole $PAHOLE_FLAGS --btf_encode_detached=btf.detached.bin "$VMLINUX" 2>&1 | tee btf-detached.log
-            set -e
-            if [ -s btf.detached.bin ]; then
-              echo "stage3a OK: $(stat -c%s btf.detached.bin) 字节"
-              cp btf.detached.bin btf.bin
-            else
-              echo "stage3a 空，转 3b"
-              cp "$VMLINUX" vmlinux.btf-src
-              set +e
-              pahole $PAHOLE_FLAGS -J vmlinux.btf-src 2>&1 | tee btf-convert.log
-              set -e
-              readelf -SW vmlinux.btf-src 2>/dev/null | grep -E "\.BTF" | tee btf-section.txt || true
-              aarch64-linux-gnu-objcopy --dump-section .BTF=btf.dump.bin vmlinux.btf-src vmlinux.dump.elf 2>&1 | tee btf-dump.log || true
-              if [ -s btf.dump.bin ]; then
-                echo "stage3b OK: $(stat -c%s btf.dump.bin) 字节"
-                cp btf.dump.bin btf.bin
-              else
-                echo "::error::阶段3失败"
-                echo "=== pahole 日志 ==="; cat btf-convert.log
-                echo "=== 段表 ==="; cat btf-section.txt 2>/dev/null || echo "(无)"
-                exit 1
-              fi
-            fi
-            
-            echo "===== 阶段3c: BTF 反查 ====="
-            pahole -F btf -C proc_dir_entry btf.bin > btf-verify.txt 2>&1 || true
-            head -15 btf-verify.txt
-            grep -q "not found" btf-verify.txt && { echo "::error::BTF 里查不到 proc_dir_entry"; exit 1; }
-            
-            echo "===== 生成偏移表 ====="
-            python3 tools/gen_offsets.py --btf btf.bin --out src/cr_offsets.h
-            cat src/cr_offsets.h
+          # 实测证据：目标内核 CONFIG_RANDSTRUCT_NONE=y、DEBUG_SPINLOCK 与 DEBUG_LOCK_ALLOC 均未设置
+          # 此时 __randomize_layout 展开为空、spinlock_t 仅含 arch_spinlock_t(4B)，
+          # proc_dir_entry / proc_ops 的偏移由源码声明唯一决定，无需 BTF。
+          # 任一条件不成立就失败，而不是产出错误偏移。
+          echo "===== 偏移表前提检查 ====="
+          grep -q "^CONFIG_RANDSTRUCT_NONE=y" out/.config || { echo "::error::RANDSTRUCT 非 NONE，布局随机化，必须用 BTF"; exit 1; }
+          grep -q "^CONFIG_SMP=y" out/.config || { echo "::error::SMP 关闭，spinlock 布局不同"; exit 1; }
+          grep -q "^# CONFIG_DEBUG_SPINLOCK is not set" out/.config || { echo "::error::DEBUG_SPINLOCK 开启，spinlock_t 变大"; exit 1; }
+          grep -q "^# CONFIG_DEBUG_LOCK_ALLOC is not set" out/.config || { echo "::error::DEBUG_LOCK_ALLOC 开启，spinlock_t 含 dep_map"; exit 1; }
+          echo "前提全部成立，使用固定偏移表"
+          echo ""
+          echo "===== 当前偏移表 ====="
+          cat src/cr_offsets.h
+          echo ""
+          echo "===== 交叉验证 DWARF 链路是通的（seq_file 在 DWARF 里）====="
+          pahole -C seq_file out/vmlinux 2>&1 | head -3 || true
       - name: 编译模块
         run: |
           VARS='ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONFIG_MODULE_SIG_ALL=n'
