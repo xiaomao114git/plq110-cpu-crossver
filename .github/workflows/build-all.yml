@@ -35,7 +35,8 @@ jobs:
           - { branch: 'android14-6.1',  kernel: '6.1',  backend: 'proc' }
           - { branch: 'android15-6.6',  kernel: '6.6',  backend: 'rvh'  }
           - { branch: 'android16-6.12', kernel: '6.12', backend: 'proc' }
-          - { branch: 'android17-6.18', kernel: '6.18', backend: 'proc' }
+          # 6.18 的 proc_dir_entry 已删除 proc_dops 字段，布局与 5.10-6.12 不同，
+          # 需要单独的偏移表，暂不纳入本轮（见 GPT 复核 E7）
     steps:
       - uses: actions/checkout@v4
 
@@ -84,17 +85,17 @@ jobs:
         run: |
           set -o pipefail
           make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            -j$(nproc) vmlinux > build.log 2>&1
+            -j$(nproc) vmlinux 2>&1 | tee vmlinux-full.log
           RC=$?
           echo "make 退出码: $RC"
           if [ $RC -ne 0 ]; then
             echo "===== 自动提取的错误上下文 ====="
             grep -n -B3 -A8 -E "error:|Error [0-9]|No such file|not found|undefined" build.log | head -150
             echo "===== 日志尾部 60 行 ====="
-            tail -60 build.log
+            tail -60 vmlinux-full.log
             exit $RC
           fi
-          tail -20 build.log
+          tail -20 vmlinux-full.log
           ls -la out/vmlinux
 
       - name: modules_prepare（生成 module.lds 等模块构建文件）
@@ -120,10 +121,37 @@ jobs:
           # proc_dir_entry / proc_ops 的偏移由源码声明唯一决定，无需 BTF。
           # 任一条件不成立就失败，而不是产出错误偏移。
           echo "===== 偏移表前提检查 ====="
-          grep -q "^CONFIG_RANDSTRUCT_NONE=y" out/.config || { echo "::error::RANDSTRUCT 非 NONE，布局随机化，必须用 BTF"; exit 1; }
-          grep -q "^CONFIG_SMP=y" out/.config || { echo "::error::SMP 关闭，spinlock 布局不同"; exit 1; }
-          grep -q "^# CONFIG_DEBUG_SPINLOCK is not set" out/.config || { echo "::error::DEBUG_SPINLOCK 开启，spinlock_t 变大"; exit 1; }
-          grep -q "^# CONFIG_DEBUG_LOCK_ALLOC is not set" out/.config || { echo "::error::DEBUG_LOCK_ALLOC 开启，spinlock_t 含 dep_map"; exit 1; }
+          FAIL=0
+          # RANDSTRUCT 有两套配置体系，都要覆盖：
+          #   新体系(6.1+)  CONFIG_RANDSTRUCT_NONE=y
+          #   旧体系(5.10/5.15) CONFIG_GCC_PLUGIN_RANDSTRUCT 未设置
+          if grep -q "^CONFIG_RANDSTRUCT_NONE=y" out/.config; then
+            echo "  [OK] RANDSTRUCT: NONE（新体系）"
+          elif grep -q "^# CONFIG_GCC_PLUGIN_RANDSTRUCT is not set" out/.config; then
+            echo "  [OK] RANDSTRUCT: 旧体系插件未启用"
+          else
+            echo "  [FAIL] RANDSTRUCT 状态未知或已启用"
+            grep -E "RANDSTRUCT" out/.config || echo "    (无相关项)"
+            FAIL=1
+          fi
+          grep -q "^CONFIG_SMP=y" out/.config && echo "  [OK] SMP=y" || { echo "  [FAIL] SMP 关闭"; FAIL=1; }
+          grep -q "^# CONFIG_DEBUG_SPINLOCK is not set" out/.config && echo "  [OK] DEBUG_SPINLOCK=n" || { echo "  [FAIL] DEBUG_SPINLOCK 开启，spinlock_t 变大"; FAIL=1; }
+          grep -q "^# CONFIG_DEBUG_LOCK_ALLOC is not set" out/.config && echo "  [OK] DEBUG_LOCK_ALLOC=n" || { echo "  [FAIL] DEBUG_LOCK_ALLOC 开启，spinlock_t 含 dep_map"; FAIL=1; }
+          # PREEMPT_RT 会换掉 spinlock 实现（GPT 复核补充）
+          if grep -q "^CONFIG_PREEMPT_RT=y" out/.config; then
+            echo "  [FAIL] PREEMPT_RT=y，spinlock_t 是 rt_mutex_base"; FAIL=1
+          else
+            echo "  [OK] PREEMPT_RT=n"
+          fi
+          # CONFIG_COMPAT 决定 proc_ops 有没有 proc_compat_ioctl（GPT 复核补充）
+          #   COMPAT=y → sizeof(proc_ops)=96，proc_read=16（当前偏移表按这个）
+          #   COMPAT=n → sizeof(proc_ops)=88，字段前移
+          if grep -q "^CONFIG_COMPAT=y" out/.config; then
+            echo "  [OK] COMPAT=y，proc_ops=96 字节"
+          else
+            echo "  [FAIL] COMPAT!=y，proc_ops=88 字节，偏移表需重算"; FAIL=1
+          fi
+          [ $FAIL -eq 0 ] || { echo "::error::布局前提不满足"; exit 1; }
           echo "前提全部成立，使用固定偏移表"
           echo ""
           echo "===== 当前偏移表 ====="
@@ -133,16 +161,20 @@ jobs:
           pahole -C seq_file out/vmlinux 2>&1 | head -3 || true
       - name: 编译模块
         run: |
-          VARS='ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONFIG_MODULE_SIG_ALL=n'
-          if [ '${{ matrix.backend }}' = 'rvh' ]; then
-            echo '后端: RVH'
-          else
-            VARS="$VARS KCFLAGS=-DCR_FORCE_PROC=1"
+          # KCFLAGS 只能赋值一次：make 取最后一次赋值，重复赋值会丢掉前面参数
+          KCF=""
+          if [ '${{ matrix.backend }}' != 'rvh' ]; then
+            KCF="$KCF -DCR_FORCE_PROC=1"
             echo '后端: PROC'
+          else
+            echo '后端: RVH'
           fi
           if [ '${{ inputs.keep_debug }}' != 'true' ]; then
-            VARS="$VARS KCFLAGS=-g0"
+            KCF="$KCF -g0"
           fi
+          echo "KCFLAGS=$KCF"
+          VARS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONFIG_MODULE_SIG_ALL=n KCFLAGS=$KCF"
+
           if [ '${{ inputs.no_crc }}' = 'true' ] && [ -f out/Module.symvers ]; then
             mv out/Module.symvers out/Module.symvers.bak
             VARS="$VARS KBUILD_MODPOST_WARN=1 CONFIG_EXTENDED_MODVERSIONS=n"
