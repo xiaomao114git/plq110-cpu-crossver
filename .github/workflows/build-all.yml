@@ -97,21 +97,61 @@ jobs:
 
       - name: 提取 BTF 并生成偏移表
         run: |
-            KO=out/vmlinux
-            [ -f "$KO" ] || { echo "::error::没有 vmlinux"; exit 1; }
-            echo "vmlinux: $(stat -c%s $KO) 字节"
-            # 直接让 pahole 读 DWARF 写 .BTF 段，绕开 Kconfig 的 BTF 依赖探测
-            echo "== pahole -J 生成 BTF =="
-            cp "$KO" vmlinux.btf-src
-            pahole -J vmlinux.btf-src 2>&1 | tail -20
-            echo "== 提取 .BTF 段 =="
-            objcopy -O binary --only-section=.BTF vmlinux.btf-src btf.bin 2>&1 || true
-            if [ ! -s btf.bin ]; then
-              echo "::error::pahole 未能生成 .BTF 段"; exit 1
+            VMLINUX=out/vmlinux
+            test -s "$VMLINUX" || { echo "::error::没有 vmlinux"; exit 1; }
+            echo "vmlinux: $(stat -c%s $VMLINUX) 字节"
+            pahole --version | tee pahole.txt
+            echo "===== 阶段2: DWARF 结构完整性 ====="
+            set +e
+            pahole -F dwarf -C proc_dir_entry "$VMLINUX" > dwarf-pde.txt 2>&1
+            D1=$?
+            pahole -F dwarf -C proc_ops "$VMLINUX" > dwarf-pops.txt 2>&1
+            D2=$?
+            set -e
+            echo "pahole -F dwarf 退出码: pde=$D1 pops=$D2"
+            head -30 dwarf-pde.txt
+            [ $D1 -eq 0 ] || { echo "::error::阶段2失败 - DWARF 无 proc_dir_entry"; exit 1; }
+            [ $D2 -eq 0 ] || { echo "::error::阶段2失败 - DWARF 无 proc_ops"; exit 1; }
+            echo "===== 阶段3a: --btf_encode_detached ====="
+            set +e
+            pahole --btf_encode_detached=btf.detached.bin "$VMLINUX" 2>&1 | tee btf-detached.log
+            set -e
+            if [ -s btf.detached.bin ]; then
+              echo "stage3a OK: $(stat -c%s btf.detached.bin) 字节"
+              cp btf.detached.bin btf.bin
+            else
+              echo "stage3a 空，转阶段3b"
+              echo "===== 阶段3b: pahole -J + 段表 ====="
+              cp "$VMLINUX" vmlinux.btf-src
+              set +e
+              pahole -J vmlinux.btf-src 2>&1 | tee btf-convert.log
+              set -e
+              echo "--- 段表中的 .BTF ---"
+              readelf -SW vmlinux.btf-src 2>/dev/null | grep -E "\.BTF" | tee btf-section.txt || true
+              echo "--- dump-section 提取（不用 -O binary）---"
+              set +e
+              aarch64-linux-gnu-objcopy --dump-section .BTF=btf.dump.bin vmlinux.btf-src vmlinux.dump.elf 2>&1 | tee btf-dump.log
+              set -e
+              if [ -s btf.dump.bin ]; then
+                echo "stage3b OK: $(stat -c%s btf.dump.bin) 字节"
+                cp btf.dump.bin btf.bin
+              else
+                echo "::error::阶段3失败 - 两种方式都没拿到 BTF"
+                echo "=== pahole -J 日志 ==="; cat btf-convert.log
+                echo "=== 段表 ==="; cat btf-section.txt 2>/dev/null || echo "(无)"
+                exit 1
+              fi
             fi
-            echo "BTF: $(stat -c%s btf.bin) 字节"
+            echo "===== 阶段3c: BTF 反查结构 ====="
+            set +e
+            pahole -F btf -C proc_dir_entry btf.bin > btf-verify.txt 2>&1
+            VR=$?
+            set -e
+            echo "pahole -F btf 退出码: $VR"
+            head -20 btf-verify.txt
+            [ $VR -eq 0 ] || { echo "::error::阶段3失败 - BTF 查不到 proc_dir_entry"; exit 1; }
+            echo "===== 生成偏移表 ====="
             python3 tools/gen_offsets.py --btf btf.bin --out src/cr_offsets.h
-            echo "== 偏移表 =="
             cat src/cr_offsets.h
       - name: 编译模块
         run: |
