@@ -63,24 +63,18 @@ jobs:
 
       - name: 配置内核
         run: |
-            # GKI 官方配置自带 DEBUG_INFO_BTF —— 所有 GKI 设备都有
-            # /sys/kernel/btf/vmlinux，就是因为它开着。用 defconfig 反而要手动
-            # 补 BPF_SYSCALL 等一串依赖（DEBUG_INFO_BTF 依赖它）。
-            if [ -f kernel/arch/arm64/configs/gki_defconfig ]; then
-              echo "用 gki_defconfig"
-              make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- gki_defconfig
-            else
-              echo "没有 gki_defconfig，回退 defconfig + 手动补依赖"
-              make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
-              ./kernel/scripts/config --file out/.config -d DEBUG_INFO_NONE
-              ./kernel/scripts/config --file out/.config -e BPF_SYSCALL -e DEBUG_INFO -e DEBUG_INFO_BTF
-            fi
+            # gki_defconfig 自带 DEBUG_INFO=y + DWARF4，但不开 DEBUG_INFO_BTF。
+            # DEBUG_INFO_BTF 依赖 PAHOLE_VERSION 构建时探测，探不过就被 olddefconfig 关掉。
+            # 所以不走 Kconfig 那条路，后面直接用 pahole -J 从 vmlinux 生成 .BTF 段。
+            make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- gki_defconfig
             ./kernel/scripts/config --file out/.config --set-str LOCALVERSION ''
             make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
-            echo "== DEBUG_INFO / BPF 配置 =="
-            grep -E "CONFIG_DEBUG_INFO|CONFIG_BPF_SYSCALL" out/.config | head -10
-            grep -q "CONFIG_DEBUG_INFO_BTF=y" out/.config || { echo "::error::DEBUG_INFO_BTF 仍未生效"; exit 1; }
-            command -v pahole && pahole --version
+            echo "== DEBUG_INFO 配置（只需 DEBUG_INFO=y，不需要 BTF）=="
+            grep -E "CONFIG_DEBUG_INFO" out/.config | head -8
+            grep -q "CONFIG_DEBUG_INFO=y" out/.config || { echo "::error::DEBUG_INFO 未开"; exit 1; }
+            echo "== pahole =="
+            command -v pahole || { echo "::error::缺 pahole"; exit 1; }
+            pahole --version
       - name: 编译内核取 vmlinux
         run: |
           set -o pipefail
@@ -90,14 +84,22 @@ jobs:
 
       - name: 提取 BTF 并生成偏移表
         run: |
-          if ! objcopy -O binary --only-section=.BTF out/vmlinux btf.bin 2>/dev/null || [ ! -s btf.bin ]; then
-            echo '::error::vmlinux 没有 .BTF 段'; exit 1
-          fi
-          echo "BTF: $(stat -c%s btf.bin) 字节"
-          python3 tools/gen_offsets.py --btf btf.bin --out src/cr_offsets.h
-          echo '== 偏移表 =='
-          cat src/cr_offsets.h
-
+            KO=out/vmlinux
+            [ -f "$KO" ] || { echo "::error::没有 vmlinux"; exit 1; }
+            echo "vmlinux: $(stat -c%s $KO) 字节"
+            # 直接让 pahole 读 DWARF 写 .BTF 段，绕开 Kconfig 的 BTF 依赖探测
+            echo "== pahole -J 生成 BTF =="
+            cp "$KO" vmlinux.btf-src
+            pahole -J vmlinux.btf-src 2>&1 | tail -20
+            echo "== 提取 .BTF 段 =="
+            objcopy -O binary --only-section=.BTF vmlinux.btf-src btf.bin 2>&1 || true
+            if [ ! -s btf.bin ]; then
+              echo "::error::pahole 未能生成 .BTF 段"; exit 1
+            fi
+            echo "BTF: $(stat -c%s btf.bin) 字节"
+            python3 tools/gen_offsets.py --btf btf.bin --out src/cr_offsets.h
+            echo "== 偏移表 =="
+            cat src/cr_offsets.h
       - name: 编译模块
         run: |
           VARS='ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONFIG_MODULE_SIG_ALL=n'
