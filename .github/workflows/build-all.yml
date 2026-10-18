@@ -82,7 +82,17 @@ jobs:
         run: |
           set -o pipefail
           make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
-            -j$(nproc) vmlinux 2>&1 | tail -40
+            -j$(nproc) vmlinux > build.log 2>&1
+          RC=$?
+          echo "make 退出码: $RC"
+          if [ $RC -ne 0 ]; then
+            echo "===== 自动提取的错误上下文 ====="
+            grep -n -B3 -A8 -E "error:|Error [0-9]|No such file|not found|undefined" build.log | head -150
+            echo "===== 日志尾部 60 行 ====="
+            tail -60 build.log
+            exit $RC
+          fi
+          tail -20 build.log
           ls -la out/vmlinux
 
       - name: 提取 BTF 并生成偏移表
