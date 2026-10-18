@@ -65,8 +65,14 @@ jobs:
         run: |
           make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
           ./kernel/scripts/config --file out/.config --set-str LOCALVERSION ''
-          ./kernel/scripts/config --file out/.config -e DEBUG_INFO
-          ./kernel/scripts/config --file out/.config -e DEBUG_INFO_BTF
+          ./kernel/scripts/config --file out/.config -e DEBUG_INFO -e DEBUG_INFO_BTF
+          # scripts/config 只改文件，依赖必须靠 olddefconfig 重新解析
+          # 少了这步 DEBUG_INFO_BTF 不生效，vmlinux 里就没有 .BTF 段
+          make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+          echo "== BTF 配置 =="
+          grep -E "CONFIG_DEBUG_INFO" out/.config | head -6
+          grep -q "CONFIG_DEBUG_INFO_BTF=y" out/.config || { echo "::error::DEBUG_INFO_BTF 未生效"; exit 1; }
+          command -v pahole && pahole --version
 
       - name: 编译内核取 vmlinux
         run: |
