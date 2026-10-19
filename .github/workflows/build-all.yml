@@ -103,6 +103,10 @@ jobs:
             # 那个文件由 Google KMI 构建流程生成，aosp-mirror 源码里没有。
             # 我们不需要 KMI 稳定性，关掉它（不影响 struct module 布局）。
             ./kernel/scripts/config --file out/.config -d TRIM_UNUSED_KSYMS
+            # 设备配置开了 DEBUG_INFO_BTF_MODULES，会要求每个模块生成 BTF 段。
+            # 但我们的 vmlinux 没有 .BTF（pahole 1.25 编不出），pahole 会报
+            # Invalid argument 并删掉刚编好的 .ko。关掉它不影响 struct module 布局。
+            ./kernel/scripts/config --file out/.config -d DEBUG_INFO_BTF_MODULES
             ./kernel/scripts/config --file out/.config -d DEBUG_INFO_NONE
             ./kernel/scripts/config --file out/.config -e DEBUG_INFO -e DEBUG_INFO_DWARF4
             ./kernel/scripts/config --file out/.config --set-str LOCALVERSION ''
