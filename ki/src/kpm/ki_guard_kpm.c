@@ -48,6 +48,7 @@ KPM_DESCRIPTION("Per-uid isolation of device-flag persist dirs (BTF-driven, no f
 
 #define KI_MAX_UIDS 32
 #define KI_MAX_DIRS 8
+#define KI_MAX_SUPP 8
 
 /* ---------------- 配置 ---------------- */
 
@@ -67,6 +68,17 @@ static int ki_ntargets;
 
 static int ki_argno = 3;      /* 6.x: inode_permission(idmap, inode, mask) */
 static int ki_inode_arg = 1;  /* inode 在 arg1 */
+
+/* 厂商上报压制：目标符号名，逗号分隔 */
+static char ki_supp_specs[KI_MAX_SUPP][96];
+static int ki_nsupp_want;
+static int ki_nsupp_hooked;
+
+/* 累计拦截次数（统计用，单写多读，不需要强一致性） */
+static uint64_t ki_intercepts;
+
+/* 被替换掉的函数，卸载时要逐个 unhook */
+static uint64_t ki_supp_funcs[KI_MAX_SUPP];
 
 /* ---------------- BTF 偏移 ---------------- */
 
@@ -178,6 +190,31 @@ static void ki_parse_dirs(const char *val, int len)
 			i++;
 	}
 	ki_ndirs_want = n;
+}
+
+static void ki_parse_supps(const char *val, int len)
+{
+	int i = 0, n = 0;
+
+	ki_nsupp_want = 0;
+	while (i < len && n < KI_MAX_SUPP) {
+		int j = i;
+		int k = 0;
+
+		while (j < len && val[j] != ',')
+			j++;
+		if (j > i) {
+			while (i < j && k < (int)sizeof(ki_supp_specs[0]) - 1)
+				ki_supp_specs[n][k++] = val[i++];
+			ki_supp_specs[n][k] = '\0';
+			n++;
+		} else {
+			i++;
+		}
+		if (i < len && val[i] == ',')
+			i++;
+	}
+	ki_nsupp_want = n;
 }
 
 /* ---------------- 目录解析 ---------------- */
@@ -300,93 +337,113 @@ static void ki_perm_before(hook_fargs3_t *fargs, void *udata)
 
 	fargs->skip_origin = 1;
 	fargs->ret = (uint64_t)(long)(-ENOENT);
+	ki_intercepts++;
 }
 
 static int ki_hooked;
+
+/* ---------------- 厂商上报压制 ---------------- */
+
+/*
+ * 用 hook() 把目标函数整个替换成一个返回 0 的桩，而不是 skip_origin 或改返回值。
+ *
+ * 区别在哪：
+ *   - kretprobe 改返回值（.ko 版的做法）：函数照跑，上报内容已经发出去了
+ *   - skip_origin：不进入函数体，但调用点仍然存在
+ *   - hook() 替换：调用点直接跳到桩，原函数完全不执行
+ *
+ * 桩的签名按"无参数、返回 long"写：aarch64 上多余参数留在寄存器里不影响，
+ * 而这些上报函数普遍是 void 或 int，调用方只看返回值。
+ */
+static long ki_suppress_stub(void)
+{
+	return 0;
+}
+
+static void ki_install_supps(void)
+{
+	int i;
+
+	ki_nsupp_hooked = 0;
+	for (i = 0; i < ki_nsupp_want; i++) {
+		uint64_t addr = kallsyms_lookup_name(ki_supp_specs[i]);
+		hook_err_t herr;
+		void *backup = 0;
+
+		if (!addr) {
+			/* 非 OPPO/一加 设备没有这些厂商符号，属正常 */
+			pr_info("ki_guard: suppress '%s' 不存在，跳过\n", ki_supp_specs[i]);
+			continue;
+		}
+
+		herr = hook((void *)addr, (void *)ki_suppress_stub, &backup);
+		if (herr != HOOK_NO_ERR) {
+			pr_info("ki_guard: suppress '%s' hook 失败 rc=%d\n",
+				ki_supp_specs[i], (int)herr);
+			continue;
+		}
+
+		ki_supp_funcs[ki_nsupp_hooked] = addr;
+		ki_nsupp_hooked++;
+		pr_info("ki_guard: suppress '%s' armed (addr=%llx)\n",
+			ki_supp_specs[i], (unsigned long long)addr);
+	}
+}
 
 /* ---------------- 状态 ---------------- */
 
 static void ki_fill_status(char *out, int outlen)
 {
-	int n = 0, i, j;
+	int n = 0, i;
 
-#define KI_PUT(s)                                        \
+#define KI_PUTS(s)                                       \
 	do {                                             \
 		const char *_s = (s);                    \
 		while (*_s && n < outlen - 1)            \
 			out[n++] = *_s++;                \
 	} while (0)
 
-	KI_PUT("hooked=");
-	KI_PUT(ki_hooked ? "1" : "0");
-	KI_PUT(" uids=");
+#define KI_PUTU(v)                                             \
+	do {                                                   \
+		uint64_t _v = (uint64_t)(v);                   \
+		char _t[24];                                   \
+		int _c = 0, _j;                                \
+		if (_v == 0) {                                 \
+			_t[_c++] = '0';                        \
+		} else {                                       \
+			while (_v) {                           \
+				_t[_c++] = (char)('0' + _v % 10); \
+				_v /= 10;                      \
+			}                                      \
+		}                                              \
+		for (_j = _c - 1; _j >= 0 && n < outlen - 1; _j--) \
+			out[n++] = _t[_j];                     \
+	} while (0)
+
+	KI_PUTS("hooked=");
+	KI_PUTU(ki_hooked);
+	KI_PUTS(" uids=");
 	for (i = 0; i < ki_nuids; i++) {
-		uint32_t v = ki_uids[i];
-		char tmp[12];
-		int t = 0;
-		if (v == 0) {
-			tmp[t++] = '0';
-		} else {
-			while (v) {
-				tmp[t++] = (char)('0' + v % 10);
-				v /= 10;
-			}
-		}
 		if (i)
-			KI_PUT(",");
-		for (j = t - 1; j >= 0; j--)
-			out[n++] = tmp[j];
+			KI_PUTS(",");
+		KI_PUTU(ki_uids[i]);
 	}
-	KI_PUT(" dirs=");
-	{
-		char tmp[12];
-		uint32_t v = (uint32_t)ki_ntargets;
-		int t = 0;
-		if (v == 0) {
-			tmp[t++] = '0';
-		} else {
-			while (v) {
-				tmp[t++] = (char)('0' + v % 10);
-				v /= 10;
-			}
-		}
-		for (j = t - 1; j >= 0; j--)
-			out[n++] = tmp[j];
-	}
-	KI_PUT("/");
-	{
-		char tmp[12];
-		uint32_t v = (uint32_t)ki_ndirs_want;
-		int t = 0;
-		if (v == 0) {
-			tmp[t++] = '0';
-		} else {
-			while (v) {
-				tmp[t++] = (char)('0' + v % 10);
-				v /= 10;
-			}
-		}
-		for (j = t - 1; j >= 0; j--)
-			out[n++] = tmp[j];
-	}
-	KI_PUT(" argno=");
-	{
-		char tmp[12];
-		uint32_t v = (uint32_t)ki_argno;
-		int t = 0;
-		if (v == 0) {
-			tmp[t++] = '0';
-		} else {
-			while (v) {
-				tmp[t++] = (char)('0' + v % 10);
-				v /= 10;
-			}
-		}
-		for (j = t - 1; j >= 0; j--)
-			out[n++] = tmp[j];
-	}
+	KI_PUTS(" dirs=");
+	KI_PUTU(ki_ntargets);
+	KI_PUTS("/");
+	KI_PUTU(ki_ndirs_want);
+	KI_PUTS(" supp=");
+	KI_PUTU(ki_nsupp_hooked);
+	KI_PUTS("/");
+	KI_PUTU(ki_nsupp_want);
+	KI_PUTS(" intercepts=");
+	KI_PUTU(ki_intercepts);
+	KI_PUTS(" argno=");
+	KI_PUTU(ki_argno);
 	out[n] = '\0';
-#undef KI_PUT
+
+#undef KI_PUTU
+#undef KI_PUTS
 }
 
 /* ---------------- 入口 ---------------- */
@@ -406,6 +463,9 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	ki_nuids = 0;
 	ki_ndirs_want = 0;
 	ki_ntargets = 0;
+	ki_nsupp_want = 0;
+	ki_nsupp_hooked = 0;
+	ki_intercepts = 0;
 	ki_hooked = 0;
 
 	if (args && ki_take_value(args, "uids", &val, &len))
@@ -414,14 +474,17 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	if (args && ki_take_value(args, "dirs", &val, &len))
 		ki_parse_dirs(val, len);
 
+	if (args && ki_take_value(args, "suppress", &val, &len))
+		ki_parse_supps(val, len);
+
 	if (args && ki_take_value(args, "argno", &val, &len)) {
 		uint32_t tmp[1] = { 0 };
 		if (ki_parse_u32_list(val, val + len, tmp, 1) == 1 && tmp[0] >= 1 && tmp[0] <= 5)
 			ki_argno = (int)tmp[0];
 	}
 
-	pr_info("ki_guard: uids=%d dirs_want=%d argno=%d\n",
-		ki_nuids, ki_ndirs_want, ki_argno);
+	pr_info("ki_guard: uids=%d dirs_want=%d supp_want=%d argno=%d\n",
+		ki_nuids, ki_ndirs_want, ki_nsupp_want, ki_argno);
 
 	if (ki_nuids <= 0)
 		pr_warn("ki_guard: 没有目标 uid，模块不会做任何事\n");
@@ -471,8 +534,14 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	}
 
 	ki_hooked = 1;
-	pr_info("ki_guard: active (uids=%d dirs=%d/%d)\n",
-		ki_nuids, ki_ntargets, ki_ndirs_want);
+
+	/* 厂商上报压制：符号不存在属正常，逐个记录不阻塞 */
+	if (ki_nsupp_want > 0)
+		ki_install_supps();
+
+	pr_info("ki_guard: active (uids=%d dirs=%d/%d supp=%d/%d)\n",
+		ki_nuids, ki_ntargets, ki_ndirs_want,
+		ki_nsupp_hooked, ki_nsupp_want);
 	return 0;
 }
 
@@ -509,8 +578,17 @@ static long ki_control1(void *a1, void *a2, void *a3)
 static long ki_exit(void *__user reserved)
 {
 	uint64_t addr;
+	int i;
 
 	(void)reserved;
+
+	/* 先撤抑制，再撤主 hook：反过来会让抑制窗口短暂悬空 */
+	for (i = 0; i < ki_nsupp_hooked; i++) {
+		if (ki_supp_funcs[i])
+			unhook((void *)ki_supp_funcs[i]);
+		ki_supp_funcs[i] = 0;
+	}
+	ki_nsupp_hooked = 0;
 
 	if (ki_hooked) {
 		addr = kallsyms_lookup_name("inode_permission");
@@ -519,7 +597,8 @@ static long ki_exit(void *__user reserved)
 		ki_hooked = 0;
 	}
 
-	pr_info("ki_guard: unloaded\n");
+	pr_info("ki_guard: unloaded (intercepts=%llu)\n",
+		(unsigned long long)ki_intercepts);
 	return 0;
 }
 
