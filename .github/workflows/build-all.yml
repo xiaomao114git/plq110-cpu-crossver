@@ -71,7 +71,7 @@ jobs:
           if [ ! -f kernel/Makefile ]; then
             rm -rf kernel
             git clone --depth 1 -b ${{ matrix.branch }} \
-              https://android.googlesource.com/kernel/common kernel
+              https://github.com/aosp-mirror/kernel_common kernel
           fi
           echo '== 源码版本 =='
           grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) +=' kernel/Makefile | head -3
