@@ -167,7 +167,6 @@ jobs:
           pahole -C seq_file out/vmlinux 2>&1 | head -3 || true
       - name: 编译模块
         run: |
-          # KCFLAGS 只能赋值一次：make 取最后一次赋值，重复赋值会丢掉前面参数
           KCF=""
           if [ '${{ matrix.backend }}' != 'rvh' ]; then
             KCF="$KCF -DCR_FORCE_PROC=1"
@@ -179,47 +178,50 @@ jobs:
             KCF="$KCF -g0"
           fi
           echo "KCFLAGS=$KCF"
-          VARS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONFIG_MODULE_SIG_ALL=n"
 
-          # 关键：不能移走 Module.symvers。它不只是 CRC 表，还是符号定义表。
-          # 移走后 modpost 找不到任何内核符号，6.6+ 会直接报 ERROR 而不是 WARNING。
-          # 正确做法：保留 symvers 让符号正常解析，编译完再删掉 .ko 里的 __versions 段。
-          echo "Module.symvers: $(wc -l < out/Module.symvers 2>/dev/null || echo 0) 行"
+          # make vmlinux 只产出 vmlinux.symvers，外部模块要读的是 Module.symvers。
+          # 两者格式相同，缺了 Module.symvers modpost 就拿不到内核符号，
+          # 会把 strcmp/__kmalloc 等全部报成 undefined。
+          if [ ! -s out/Module.symvers ]; then
+            if [ -s out/vmlinux.symvers ]; then
+              cp out/vmlinux.symvers out/Module.symvers
+              echo "从 vmlinux.symvers 生成 Module.symvers: $(wc -l < out/Module.symvers) 行"
+            else
+              echo '::error::既无 Module.symvers 也无 vmlinux.symvers'
+              exit 1
+            fi
+          fi
+          echo "Module.symvers: $(wc -l < out/Module.symvers) 行"
+
           set +e
-          make -C out "M=$PWD/src" $VARS "KCFLAGS=$KCF" modules -j$(nproc) 2>&1 | tail -30
+          make -C out "M=$PWD/src" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+               CONFIG_MODULE_SIG_ALL=n "KCFLAGS=$KCF" \
+               V=1 --output-sync=target modules -j2 2>&1 | tee module-build.log
           RC=${PIPESTATUS[0]}
-          if [ -f src/cpuinfo_redirect.mod.c ] && grep -q '__version_ext_names") =$' src/cpuinfo_redirect.mod.c; then
-            echo '修补 .mod.c 空初始化'
-            VLINE=$(grep -n '__version_ext_names") =$' src/cpuinfo_redirect.mod.c | head -1 | cut -d: -f1)
-            head -n "$VLINE" src/cpuinfo_redirect.mod.c > /tmp/m.c
-            printf '\t"";\n' >> /tmp/m.c
-            tail -n +$((VLINE + 2)) src/cpuinfo_redirect.mod.c >> /tmp/m.c
-            mv /tmp/m.c src/cpuinfo_redirect.mod.c
-            touch src/cpuinfo_redirect.mod.c
-            make -C out "M=$PWD/src" $VARS "KCFLAGS=$KCF" modules -j$(nproc) 2>&1 | tail -10
-            RC=$?
-          fi
-          [ -f out/Module.symvers.bak ] && mv out/Module.symvers.bak out/Module.symvers
-          ls -la src/*.ko
-          # Remove __versions so kernel check_version finds no CRC and passes.
-          # Symbols already resolved via Module.symvers, so modpost succeeds.
-          if [ -f src/cpuinfo_redirect.ko ]; then
-            if aarch64-linux-gnu-objcopy --remove-section=__versions \
-                 src/cpuinfo_redirect.ko src/cpuinfo_redirect-nocrc.ko 2>/dev/null \
-               && [ -s src/cpuinfo_redirect-nocrc.ko ]; then
-              mv src/cpuinfo_redirect-nocrc.ko src/cpuinfo_redirect.ko
-              echo "removed __versions, now $(stat -c%s src/cpuinfo_redirect.ko) bytes"
-            else
-              echo "no __versions to remove (ok)"
-            fi
-            if strings src/cpuinfo_redirect.ko | grep -q __versions; then
-              echo "::warning::__versions still present"
-            else
-              echo "confirmed: no __versions section"
-            fi
-          exit $RC
+          set -e
+
+          echo "make 退出码: $RC"
+          if [ $RC -ne 0 ]; then
+            echo "===== 第一个错误及上下文 ====="
+            grep -n -i -B3 -A30 -m1 -E 'error|undefined|No such file' module-build.log || tail -60 module-build.log
           fi
 
+          if [ $RC -eq 0 ]; then
+            if [ ! -s src/cpuinfo_redirect.ko ]; then
+              echo '::error::make 成功但无 .ko'
+              RC=1
+            else
+              echo "产物: $(stat -c%s src/cpuinfo_redirect.ko) 字节"
+              if strings src/cpuinfo_redirect.ko | grep -q __versions; then
+                echo "含 __versions 段（正常，匹配目标 CONFIG_MODVERSIONS=y）"
+              else
+                echo "::warning::缺 __versions 段，目标 check_version 会返回 -ENOEXEC"
+              fi
+            fi
+          fi
+
+          echo "最终退出码: $RC"
+          exit $RC
       - name: 校验产物
         run: |
           KO=src/cpuinfo_redirect.ko
