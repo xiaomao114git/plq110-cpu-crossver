@@ -125,13 +125,19 @@ jobs:
           # RANDSTRUCT 有两套配置体系，都要覆盖：
           #   新体系(6.1+)  CONFIG_RANDSTRUCT_NONE=y
           #   旧体系(5.10/5.15) CONFIG_GCC_PLUGIN_RANDSTRUCT 未设置
+          # 三种情况都等价于「布局不随机化」：
+          #   a) 新体系显式 NONE
+          #   b) 旧体系插件存在但未启用
+          #   c) 该内核根本没有 RANDSTRUCT 配置项（arm64 不开 GCC_PLUGINS 时就是这样）
           if grep -q "^CONFIG_RANDSTRUCT_NONE=y" out/.config; then
-            echo "  [OK] RANDSTRUCT: NONE（新体系）"
+            echo "  [OK] RANDSTRUCT: NONE（新体系显式关闭）"
           elif grep -q "^# CONFIG_GCC_PLUGIN_RANDSTRUCT is not set" out/.config; then
-            echo "  [OK] RANDSTRUCT: 旧体系插件未启用"
+            echo "  [OK] RANDSTRUCT: 旧体系插件存在但未启用"
+          elif ! grep -q "RANDSTRUCT" out/.config; then
+            echo "  [OK] RANDSTRUCT: 该内核无此配置项（arm64 未启用 GCC_PLUGINS）"
           else
-            echo "  [FAIL] RANDSTRUCT 状态未知或已启用"
-            grep -E "RANDSTRUCT" out/.config || echo "    (无相关项)"
+            echo "  [FAIL] RANDSTRUCT 已启用，布局被随机化"
+            grep -E "RANDSTRUCT" out/.config
             FAIL=1
           fi
           grep -q "^CONFIG_SMP=y" out/.config && echo "  [OK] SMP=y" || { echo "  [FAIL] SMP 关闭"; FAIL=1; }
