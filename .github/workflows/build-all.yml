@@ -181,10 +181,10 @@ jobs:
           echo "KCFLAGS=$KCF"
           VARS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONFIG_MODULE_SIG_ALL=n"
 
-          if [ '${{ inputs.no_crc }}' = 'true' ] && [ -f out/Module.symvers ]; then
-            mv out/Module.symvers out/Module.symvers.bak
-            VARS="$VARS KBUILD_MODPOST_WARN=1 CONFIG_EXTENDED_MODVERSIONS=n"
-          fi
+          # 关键：不能移走 Module.symvers。它不只是 CRC 表，还是符号定义表。
+          # 移走后 modpost 找不到任何内核符号，6.6+ 会直接报 ERROR 而不是 WARNING。
+          # 正确做法：保留 symvers 让符号正常解析，编译完再删掉 .ko 里的 __versions 段。
+          echo "Module.symvers: $(wc -l < out/Module.symvers 2>/dev/null || echo 0) 行"
           set +e
           make -C out "M=$PWD/src" $VARS "KCFLAGS=$KCF" modules -j$(nproc) 2>&1 | tail -30
           RC=${PIPESTATUS[0]}
@@ -201,7 +201,24 @@ jobs:
           fi
           [ -f out/Module.symvers.bak ] && mv out/Module.symvers.bak out/Module.symvers
           ls -la src/*.ko
+          # Remove __versions so kernel check_version finds no CRC and passes.
+          # Symbols already resolved via Module.symvers, so modpost succeeds.
+          if [ -f src/cpuinfo_redirect.ko ]; then
+            if aarch64-linux-gnu-objcopy --remove-section=__versions \
+                 src/cpuinfo_redirect.ko src/cpuinfo_redirect-nocrc.ko 2>/dev/null \
+               && [ -s src/cpuinfo_redirect-nocrc.ko ]; then
+              mv src/cpuinfo_redirect-nocrc.ko src/cpuinfo_redirect.ko
+              echo "removed __versions, now $(stat -c%s src/cpuinfo_redirect.ko) bytes"
+            else
+              echo "no __versions to remove (ok)"
+            fi
+            if strings src/cpuinfo_redirect.ko | grep -q __versions; then
+              echo "::warning::__versions still present"
+            else
+              echo "confirmed: no __versions section"
+            fi
           exit $RC
+          fi
 
       - name: 校验产物
         run: |
