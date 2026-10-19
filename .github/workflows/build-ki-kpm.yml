@@ -58,16 +58,17 @@ jobs:
           echo "size: $(wc -c < $f) B"
           readelf -h "$f" | grep -E 'Class|Machine|Type'
           echo "--- KPM 专属节 ---"
-          readelf -S "$f" | grep -E '\.kpm' || {
-            echo "::error::没有 .kpm.info 节，不是合法 KPM"; exit 1; }
-          echo "--- KPM 约定符号 ---"
-          readelf -sW "$f" | grep -E '__kpm_' || {
-            echo "::error::没有 __kpm_* 符号"; exit 1; }
-          # 必须导出 init，否则运行时不认
-          readelf -sW "$f" | grep -q '__kpm_init' \
-            && echo "OK __kpm_init" \
-            || { echo "::error::缺 __kpm_init"; exit 1; }
-          echo "--- 引用到的内核符号 ---"
+          readelf -SW "$f" | grep -E '\.kpm' || {
+            echo "::error::没有 .kpm.* 节，不是合法 KPM"; exit 1; }
+          # KernelPatch 靠节定位入口：.kpm.info 放元信息，.rela.kpm.init 是入口重定位
+          for sec in .kpm.info .kpm.init .rela.kpm.init; do
+            readelf -SW "$f" | grep -q -- "$sec" \
+              && echo "OK 节 $sec" \
+              || { echo "::error::缺节 $sec"; exit 1; }
+          done
+          echo "--- KPM 约定符号（strip 后可能已丢，仅提示）---"
+          readelf -sW "$f" | grep -E '__kpm_' | head -10 || echo "  (符号已 strip，靠节定位，正常)"
+          echo "--- 引用到的未定义符号 ---"
           readelf -sW "$f" | awk '$7=="UND"{print "  " $8}' | head -30
           echo "sha256: $(sha256sum $f | cut -d' ' -f1)"
 
