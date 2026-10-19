@@ -99,6 +99,10 @@ jobs:
             # 目标设备 CONFIG_MODVERSIONS=y，CI 必须一致，否则 .ko 里不会有 __versions 段，
             # 加载时 check_version 会走 try_to_force_load() 返回 -ENOEXEC。
             ./kernel/scripts/config --file out/.config -e MODVERSIONS
+            # 设备配置开了 TRIM_UNUSED_KSYMS 并依赖 abi_symbollist.raw，
+            # 那个文件由 Google KMI 构建流程生成，aosp-mirror 源码里没有。
+            # 我们不需要 KMI 稳定性，关掉它（不影响 struct module 布局）。
+            ./kernel/scripts/config --file out/.config -d TRIM_UNUSED_KSYMS
             ./kernel/scripts/config --file out/.config -d DEBUG_INFO_NONE
             ./kernel/scripts/config --file out/.config -e DEBUG_INFO -e DEBUG_INFO_DWARF4
             ./kernel/scripts/config --file out/.config --set-str LOCALVERSION ''
@@ -119,7 +123,7 @@ jobs:
           echo "make 退出码: $RC"
           if [ $RC -ne 0 ]; then
             echo "===== 自动提取的错误上下文 ====="
-            grep -n -B3 -A8 -E "error:|Error [0-9]|No such file|not found|undefined" build.log | head -150
+            grep -n -B3 -A8 -E "error:|Error [0-9]|No such file|not found|undefined" vmlinux-full.log | head -150
             echo "===== 日志尾部 60 行 ====="
             tail -60 vmlinux-full.log
             exit $RC
