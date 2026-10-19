@@ -49,12 +49,12 @@ jobs:
           set -e
           cd ki/src/kpm
           make KP_DIR="$GITHUB_WORKSPACE/kp" 2>&1 | tee /tmp/build.log
-          ls -l ki_guard.kpm
+          ls -l msm_drm_notify.kpm
 
       - name: 校验产物是合法 KPM
         run: |
           set -e
-          f=ki/src/kpm/ki_guard.kpm
+          f=ki/src/kpm/msm_drm_notify.kpm
           echo "size: $(wc -c < $f) B"
           readelf -h "$f" | grep -E 'Class|Machine|Type'
           echo "--- KPM 专属节 ---"
@@ -76,6 +76,6 @@ jobs:
         with:
           name: ki_guard-kpm
           path: |
-            ki/src/kpm/ki_guard.kpm
+            ki/src/kpm/msm_drm_notify.kpm
             /tmp/build.log
           if-no-files-found: error
