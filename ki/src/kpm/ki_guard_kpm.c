@@ -95,7 +95,7 @@ static uint64_t ki_supp_funcs[KI_MAX_SUPP];
 /* ---- 按需锁定 ---- */
 static int ki_enabled = 1;          /* ctl1 切；相当于原版的 lock/unlock */
 
-/* ---- 目录条目隐藏 ---- */
+/* ---- 目录条目过滤 ---- */
 /*
  * 原版靠替换 inode_operations 让条目从 readdir 结果里消失。这里不改那个
  * 只读结构，改成在 iterate_dir 里换掉 ctx->actor：dir_context 是调用方栈上
@@ -503,7 +503,7 @@ static void ki_prepare_hide(void)
 		}
 		ki_hide_name[ok][j] = '\0';
 
-		KI_LOG("drmn: hide entry '%s' under parent dentry=%llx\n",
+		KI_LOG("drmn: entry '%s' parent=%llx\n",
 			ki_hide_name[ok], (unsigned long long)dentry);
 		ok++;
 	}
@@ -671,7 +671,7 @@ static void ki_fill_status(char *out, int outlen)
 	KI_PUTU(ki_ntargets);
 	KI_PUTS("/");
 	KI_PUTU(ki_ndirs_want);
-	KI_PUTS(" hide=");
+	KI_PUTS(" ent=");
 	KI_PUTU(ki_nhide);
 	KI_PUTS(" iter=");
 	KI_PUTU(ki_iter_hooked);
@@ -679,7 +679,7 @@ static void ki_fill_status(char *out, int outlen)
 	KI_PUTU(ki_nsupp_hooked);
 	KI_PUTS("/");
 	KI_PUTU(ki_nsupp_want);
-	KI_PUTS(" intercepts=");
+	KI_PUTS(" hits=");
 	KI_PUTU(ki_intercepts);
 	KI_PUTS(" argno=");
 	KI_PUTU(ki_argno);
@@ -776,7 +776,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 
 		/* 目录条目隐藏需要父目录 dentry；与上面共用同一次解析结果 */
 		ki_prepare_hide();
-		KI_LOG("drmn: hide entries prepared %d\n", ki_nhide);
+		KI_LOG("drmn: entries prepared %d\n", ki_nhide);
 	}
 
 	/* 挂 inode_permission */
@@ -820,7 +820,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	if (ki_nsupp_want > 0)
 		ki_install_supps();
 
-	KI_LOG("drmn: active (uids=%d dirs=%d/%d hide=%d supp=%d/%d)\n",
+	KI_LOG("drmn: active (uids=%d dirs=%d/%d ent=%d supp=%d/%d)\n",
 		ki_nuids, ki_ntargets, ki_ndirs_want, ki_nhide,
 		ki_nsupp_hooked, ki_nsupp_want);
 	return 0;
@@ -895,7 +895,7 @@ static long ki_exit(void *__user reserved)
 	}
 	ki_nsupp_hooked = 0;
 
-	KI_LOG("drmn: unloaded (intercepts=%llu)\n",
+	KI_LOG("drmn: unloaded (n=%llu)\n",
 		(unsigned long long)ki_intercepts);
 	return 0;
 }
