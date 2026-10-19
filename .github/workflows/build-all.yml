@@ -173,14 +173,14 @@ jobs:
             KCF="$KCF -g0"
           fi
           echo "KCFLAGS=$KCF"
-          VARS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONFIG_MODULE_SIG_ALL=n KCFLAGS=$KCF"
+          VARS="ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- CONFIG_MODULE_SIG_ALL=n"
 
           if [ '${{ inputs.no_crc }}' = 'true' ] && [ -f out/Module.symvers ]; then
             mv out/Module.symvers out/Module.symvers.bak
             VARS="$VARS KBUILD_MODPOST_WARN=1 CONFIG_EXTENDED_MODVERSIONS=n"
           fi
           set +e
-          make -C out M=$PWD/src $VARS modules -j$(nproc) 2>&1 | tail -30
+          make -C out "M=$PWD/src" $VARS "KCFLAGS=$KCF" modules -j$(nproc) 2>&1 | tail -30
           RC=${PIPESTATUS[0]}
           if [ -f src/cpuinfo_redirect.mod.c ] && grep -q '__version_ext_names") =$' src/cpuinfo_redirect.mod.c; then
             echo '修补 .mod.c 空初始化'
@@ -190,7 +190,7 @@ jobs:
             tail -n +$((VLINE + 2)) src/cpuinfo_redirect.mod.c >> /tmp/m.c
             mv /tmp/m.c src/cpuinfo_redirect.mod.c
             touch src/cpuinfo_redirect.mod.c
-            make -C out M=$PWD/src $VARS modules -j$(nproc) 2>&1 | tail -10
+            make -C out "M=$PWD/src" $VARS "KCFLAGS=$KCF" modules -j$(nproc) 2>&1 | tail -10
             RC=$?
           fi
           [ -f out/Module.symvers.bak ] && mv out/Module.symvers.bak out/Module.symvers
