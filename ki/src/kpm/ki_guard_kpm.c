@@ -131,7 +131,7 @@ static int ki_parse_u32_list(const char *s, const char *end, uint32_t *out, int 
 /* 把 args 里 key= 之后、下一个空格之前的值取出来 */
 static int ki_take_value(const char *args, const char *key, const char **val, int *len)
 {
-	int klen = 0, i;
+	int klen = 0;
 	const char *p = args;
 
 	while (key[klen])
