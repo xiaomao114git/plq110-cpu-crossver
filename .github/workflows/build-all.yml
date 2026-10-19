@@ -83,6 +83,7 @@ jobs:
             DEVCFG="configs/plq110-${{ matrix.kernel }}.config"
             if [ -f "$DEVCFG" ]; then
               echo "使用设备真实配置: $DEVCFG"
+              mkdir -p out
               cp "$DEVCFG" out/.config
               make -C kernel O=$PWD/out ARCH=arm64 LLVM=1 olddefconfig
             else
