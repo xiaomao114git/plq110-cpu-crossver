@@ -70,7 +70,17 @@ jobs:
             # 直接 make 会缺 KMI 符号表等前置，1 分钟就挂。
             # 只需要 DEBUG_INFO=y —— 后面用 pahole -J 从 DWARF 直接生成 .BTF 段，
             # 完全不碰 DEBUG_INFO_BTF 那条 Kconfig 依赖链（它依赖 PAHOLE_VERSION 探测）。
-            make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+            # 6.6 分支用设备真实配置，保证 struct module 大小与目标内核一致
+            # defconfig 与真机配置差异会让 .gnu.linkonce.this_module 段大小不匹配
+            DEVCFG="configs/plq110-${{ matrix.kernel }}.config"
+            if [ -f "$DEVCFG" ]; then
+              echo "使用设备真实配置: $DEVCFG"
+              cp "$DEVCFG" out/.config
+              make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+            else
+              echo "无设备配置，回退 defconfig"
+              make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+            fi
             # 目标设备 CONFIG_MODVERSIONS=y，CI 必须一致，否则 .ko 里不会有 __versions 段，
             # 加载时 check_version 会走 try_to_force_load() 返回 -ENOEXEC。
             ./kernel/scripts/config --file out/.config -e MODVERSIONS
