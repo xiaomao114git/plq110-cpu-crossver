@@ -71,20 +71,46 @@ jobs:
           ld.lld --version | head -1
 
       - name: 确保 pahole >= 1.26
+        # CONFIG_DEBUG_INFO_BTF_MODULES 必须保持 y —— 它决定 struct module 里
+        # 有没有 btf_data/btf_data_size，关掉就是 1344 而不是 1536。
+        # 所以这里只能把 pahole 修好，不能像旧 workflow 那样 -d 掉这个配置。
+        #
+        # 坑：源码 make install 之后必须 ldconfig，否则 pahole 二进制在跑起来时
+        # 找不到 libdwarves_emit.so.1，报 127。原 workflow 把输出重定向到
+        # /dev/null，真正的错误被吞掉，只留下一个 exit 127。
         run: |
-          set -e
-          V=$(pahole --version 2>/dev/null | sed 's/^v//' | cut -d. -f2 || echo 0)
-          echo "pahole minor: ${V:-0}"
-          if [ "${V:-0}" -lt 26 ]; then
-            echo "::notice::pahole 过低（BTF 在 anon FWD 上会报错），源码编译 v1.27"
-            git clone --depth 1 -b v1.27 https://git.kernel.org/pub/scm/devel/pahole/pahole.git /tmp/pahole
+          set -x
+          sudo apt-get install -y -qq dwarves || true
+          sudo ldconfig
+          echo "--- 系统 pahole ---"
+          pahole --version || echo "系统 pahole 不可用（缺库或版本过低）"
+
+          NEED_BUILD=1
+          if pahole --version >/dev/null 2>&1; then
+            V=$(pahole --version | sed 's/^v//' | cut -d. -f2)
+            echo "系统 pahole minor=$V"
+            [ "${V:-0}" -ge 26 ] && NEED_BUILD=0
+          fi
+
+          if [ "$NEED_BUILD" = 1 ]; then
+            echo "::notice::源码编译 pahole v1.27"
+            rm -rf /tmp/pahole
+            git clone --depth 1 -b v1.27 \
+              https://git.kernel.org/pub/scm/devel/pahole/pahole.git /tmp/pahole
             mkdir -p /tmp/pahole/build
             cd /tmp/pahole/build
-            cmake -DCMAKE_BUILD_TYPE=Release .. >/dev/null
-            make -j"$(nproc)" >/dev/null
-            sudo make install >/dev/null
+            cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr/local ..
+            make -j"$(nproc)"
+            sudo make install
+            sudo ldconfig
           fi
+
+          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          echo "--- 最终 pahole ---"
+          command -v pahole
           pahole --version
+          V=$(pahole --version | sed 's/^v//' | cut -d. -f2)
+          [ "${V:-0}" -ge 26 ] || { echo "::error::pahole 仍低于 1.26（minor=$V）"; exit 1; }
 
       - name: 获取 GKI 源码
         run: |
@@ -126,11 +152,18 @@ jobs:
       - name: 编译 vmlinux（生成 BTF 与符号表）
         run: |
           set -o pipefail
-          make -C kernel O=$PWD/out ARCH=arm64 LLVM=1 -j"$(nproc)" vmlinux 2>&1 | tail -25
+          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
+          make -C kernel O=$PWD/out ARCH=arm64 LLVM=1 -j"$(nproc)" vmlinux 2>&1 | tail -30
+          ls -l out/vmlinux
+          # BTF 段是 pahole 生成的，没有它说明 pahole 又退化了
+          readelf -S out/vmlinux | grep -q '\.BTF' \
+            && echo "vmlinux .BTF 段: 存在" \
+            || { echo "::error::vmlinux 没有 .BTF 段，pahole 未生效"; exit 1; }
 
       - name: modules_prepare 与 Module.symvers
         run: |
           set -e
+          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
           make -C kernel O=$PWD/out ARCH=arm64 LLVM=1 modules_prepare 2>&1 | tail -5
           if [ ! -s out/Module.symvers ] && [ -s out/vmlinux.symvers ]; then
             cp out/vmlinux.symvers out/Module.symvers
@@ -141,6 +174,7 @@ jobs:
       - name: 编译 ki_guard.ko
         run: |
           set -o pipefail
+          export LD_LIBRARY_PATH="/usr/local/lib:${LD_LIBRARY_PATH:-}"
           make -C out M=$PWD/ki/src ARCH=arm64 LLVM=1 \
                CONFIG_MODULE_SIG_ALL=n modules -j2 2>&1 | tail -40
           ls -l ki/src/ki_guard.ko
