@@ -50,6 +50,12 @@ jobs:
           # 否则 struct module 等结构体布局可能与真机不一致。
           sudo ln -sf /usr/bin/clang-18 /usr/bin/clang || true
           sudo ln -sf /usr/bin/ld.lld-18 /usr/bin/ld.lld || true
+          # LLVM=1 需要整套不带版本后缀的 llvm 工具，Ubuntu 的包是带后缀的
+          for t in ar nm objcopy objdump readelf strip ranlib addr2line size strings; do
+            sudo ln -sf /usr/bin/llvm-$t-18 /usr/bin/llvm-$t 2>/dev/null || true
+          done
+          sudo ln -sf /usr/bin/llvm-cov-18 /usr/bin/llvm-cov 2>/dev/null || true
+          sudo ln -sf /usr/bin/llvm-profdata-18 /usr/bin/llvm-profdata 2>/dev/null || true
           echo "=== 工具链 ==="
           clang --version | head -1
           ld.lld --version | head -1
