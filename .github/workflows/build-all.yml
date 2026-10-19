@@ -33,7 +33,7 @@ jobs:
           - { branch: 'android12-5.10', kernel: '5.10', backend: 'proc' }
           - { branch: 'android13-5.15', kernel: '5.15', backend: 'proc' }
           - { branch: 'android14-6.1',  kernel: '6.1',  backend: 'proc' }
-          - { branch: 'android15-6.6',  kernel: '6.6',  backend: 'rvh'  }
+          - { branch: 'android15-6.6-2025-04',  kernel: '6.6',  backend: 'rvh'  }
           - { branch: 'android16-6.12', kernel: '6.12', backend: 'proc' }
           # 6.18 的 proc_dir_entry 已删除 proc_dops 字段，布局与 5.10-6.12 不同，
           # 需要单独的偏移表，暂不纳入本轮（见 GPT 复核 E7）
