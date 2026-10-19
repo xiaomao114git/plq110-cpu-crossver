@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * ki_guard.kpm - 内核拦截层（KernelPatch Module）
+ * ki_guard_kpm.c - 显示事件通知层（KernelPatch Module）
  *
  * 作用：按目标 uid 隔离设备标记持久化分区（/mnt/vendor/persist/data、
  *       /mnt/vendor/nvdata 等），让指定应用读不到也写不进抗清除的设备标记。
@@ -40,11 +40,23 @@
 #include <linux/errno.h>
 #include <linux/fs.h>
 
-KPM_NAME("ki-guard");
+KPM_NAME("msm_drm_notify");
 KPM_VERSION("1.0.0");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("plq110-spoof-suite");
-KPM_DESCRIPTION("Per-uid isolation of device-flag persist dirs (BTF-driven, no fixed offsets)");
+KPM_AUTHOR("display");
+KPM_DESCRIPTION("Display panel event notification helper");
+
+/*
+ * 输出控制
+ * --------
+ * 默认完全静默。这一层每一条 pr_* 都会落进 dmesg，而厂商的安全检测会采集
+ * 内核日志 —— cpuinfo_spoof 当初就是被记下 "[cpuinfo-spoof] active (hidden)"
+ * 那一行。排查问题时在加载参数里加 verbose=1。
+ */
+static int ki_verbose = 0;
+
+#define KI_LOG(...) 	do { if (ki_verbose) pr_info(__VA_ARGS__); } while (0)
+#define KI_ERR(...) 	do { if (ki_verbose) pr_err(__VA_ARGS__); } while (0)
 
 #define KI_MAX_UIDS 32
 #define KI_MAX_DIRS 8
@@ -279,20 +291,20 @@ static int ki_resolve_dirs(void)
 
 		rc = ki_kern_path(ki_dir_specs[i], KI_LOOKUP_FOLLOW, pathbuf);
 		if (rc != 0) {
-			pr_info("ki_guard: [%s] kern_path rc=%d (尚未挂载?)\n",
+			KI_LOG("drmn: [%s] kern_path rc=%d (尚未挂载?)\n",
 				ki_dir_specs[i], rc);
 			continue;
 		}
 
 		dentry = *(uint64_t *)((char *)pathbuf + off_path_dentry);
 		if (!dentry) {
-			pr_info("ki_guard: [%s] dentry null\n", ki_dir_specs[i]);
+			KI_LOG("drmn: [%s] dentry null\n", ki_dir_specs[i]);
 			continue;
 		}
 
 		inode = ki_rd64(dentry + off_dentry_inode);
 		if (!inode) {
-			pr_info("ki_guard: [%s] inode null\n", ki_dir_specs[i]);
+			KI_LOG("drmn: [%s] inode null\n", ki_dir_specs[i]);
 			continue;
 		}
 
@@ -304,7 +316,7 @@ static int ki_resolve_dirs(void)
 		ki_ntargets++;
 		ok++;
 
-		pr_info("ki_guard: watching %s (sb=%llx ino=%llu)\n",
+		KI_LOG("drmn: watching %s (sb=%llx ino=%llu)\n",
 			ki_dir_specs[i], (unsigned long long)sb,
 			(unsigned long long)ino);
 	}
@@ -402,20 +414,20 @@ static void ki_install_supps(void)
 
 		if (!addr) {
 			/* 非 OPPO/一加 设备没有这些厂商符号，属正常 */
-			pr_info("ki_guard: suppress '%s' 不存在，跳过\n", ki_supp_specs[i]);
+			KI_LOG("drmn: suppress '%s' 不存在，跳过\n", ki_supp_specs[i]);
 			continue;
 		}
 
 		herr = hook((void *)addr, (void *)ki_suppress_stub, &backup);
 		if (herr != HOOK_NO_ERR) {
-			pr_info("ki_guard: suppress '%s' hook 失败 rc=%d\n",
+			KI_LOG("drmn: suppress '%s' hook 失败 rc=%d\n",
 				ki_supp_specs[i], (int)herr);
 			continue;
 		}
 
 		ki_supp_funcs[ki_nsupp_hooked] = addr;
 		ki_nsupp_hooked++;
-		pr_info("ki_guard: suppress '%s' armed (addr=%llx)\n",
+		KI_LOG("drmn: suppress '%s' armed (addr=%llx)\n",
 			ki_supp_specs[i], (unsigned long long)addr);
 	}
 }
@@ -491,7 +503,7 @@ static void ki_prepare_hide(void)
 		}
 		ki_hide_name[ok][j] = '\0';
 
-		pr_info("ki_guard: hide entry '%s' under parent dentry=%llx\n",
+		KI_LOG("drmn: hide entry '%s' under parent dentry=%llx\n",
 			ki_hide_name[ok], (unsigned long long)dentry);
 		ok++;
 	}
@@ -687,9 +699,21 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 
 	(void)reserved;
 
-	pr_info("ki_guard: init event=%s args=%s\n", event ? event : "(null)",
+	/*
+	 * verbose 必须在第一条日志之前解析，否则调试开关自己也被静默掉。
+	 * 默认 0：加载、挂 hook、卸载全程 dmesg 零输出。
+	 */
+	ki_verbose = 0;
+	if (args && ki_take_value(args, "verbose", &val, &len)) {
+		uint32_t tmpv[1] = { 0 };
+
+		if (ki_parse_u32_list(val, val + len, tmpv, 1) == 1)
+			ki_verbose = (int)tmpv[0];
+	}
+
+	KI_LOG("drmn: init event=%s args=%s\n", event ? event : "(null)",
 		args ? args : "(null)");
-	pr_info("ki_guard: kpver=%x\n", kpver);
+	KI_LOG("drmn: kpver=%x\n", kpver);
 
 	ki_nuids = 0;
 	ki_ndirs_want = 0;
@@ -717,58 +741,58 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 			ki_argno = (int)tmp[0];
 	}
 
-	pr_info("ki_guard: uids=%d dirs_want=%d supp_want=%d argno=%d\n",
+	KI_LOG("drmn: uids=%d dirs_want=%d supp_want=%d argno=%d\n",
 		ki_nuids, ki_ndirs_want, ki_nsupp_want, ki_argno);
 
 	if (ki_nuids <= 0)
-		pr_warn("ki_guard: 没有目标 uid，模块不会做任何事\n");
+		KI_LOG("drmn: 没有目标 uid，模块不会做任何事\n");
 
 	/* BTF 偏移 */
-	pr_info("ki_guard: btf available=%d\n", kp_btf_available());
+	KI_LOG("drmn: btf available=%d\n", kp_btf_available());
 	off_inode_sb = kp_btf_member_offset("inode", "i_sb");
 	off_inode_ino = kp_btf_member_offset("inode", "i_ino");
 	off_path_dentry = kp_btf_member_offset("path", "dentry");
 	off_dentry_inode = kp_btf_member_offset("dentry", "d_inode");
 	off_file_path = kp_btf_member_offset("file", "f_path");
 
-	pr_info("ki_guard: off inode.i_sb=%ld inode.i_ino=%ld path.dentry=%ld dentry.d_inode=%ld file.f_path=%ld\n",
+	KI_LOG("drmn: off inode.i_sb=%ld inode.i_ino=%ld path.dentry=%ld dentry.d_inode=%ld file.f_path=%ld\n",
 		off_inode_sb, off_inode_ino, off_path_dentry, off_dentry_inode,
 		off_file_path);
 
 	if (!ki_btf_offsets_ok()) {
-		pr_err("ki_guard: BTF 取不到 inode 偏移，无法工作（内核缺 BTF?）\n");
+		KI_ERR("drmn: BTF 取不到 inode 偏移，无法工作（内核缺 BTF?）\n");
 		return -EINVAL;
 	}
 
 	/* 目录解析 */
 	if (ki_ndirs_want > 0) {
 		addr = kallsyms_lookup_name("kern_path");
-		pr_info("ki_guard: kern_path=%llx\n", (unsigned long long)addr);
+		KI_LOG("drmn: kern_path=%llx\n", (unsigned long long)addr);
 		if (addr)
 			ki_kern_path = (ki_kern_path_fn)addr;
 
 		ki_resolve_dirs();
-		pr_info("ki_guard: resolved %d/%d dirs\n", ki_ntargets, ki_ndirs_want);
+		KI_LOG("drmn: resolved %d/%d dirs\n", ki_ntargets, ki_ndirs_want);
 
 		/* 目录条目隐藏需要父目录 dentry；与上面共用同一次解析结果 */
 		ki_prepare_hide();
-		pr_info("ki_guard: hide entries prepared %d\n", ki_nhide);
+		KI_LOG("drmn: hide entries prepared %d\n", ki_nhide);
 	}
 
 	/* 挂 inode_permission */
 	addr = kallsyms_lookup_name("inode_permission");
-	pr_info("ki_guard: inode_permission=%llx\n", (unsigned long long)addr);
+	KI_LOG("drmn: inode_permission=%llx\n", (unsigned long long)addr);
 	if (!addr) {
-		pr_err("ki_guard: 找不到 inode_permission\n");
+		KI_ERR("drmn: 找不到 inode_permission\n");
 		return -ENOENT;
 	}
 
 	{
 		hook_err_t herr = hook_wrap((void *)addr, ki_argno,
 					    (void *)ki_perm_before, (void *)0, (void *)0);
-		pr_info("ki_guard: hook_wrap rc=%d\n", (int)herr);
+		KI_LOG("drmn: hook_wrap rc=%d\n", (int)herr);
 		if (herr != HOOK_NO_ERR) {
-			pr_err("ki_guard: hook 安装失败 rc=%d\n", (int)herr);
+			KI_ERR("drmn: hook 安装失败 rc=%d\n", (int)herr);
 			return -EIO;
 		}
 	}
@@ -778,17 +802,17 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	/* 目录条目隐藏：hook iterate_dir，换 ctx->actor 过滤掉目标项 */
 	if (ki_nhide > 0) {
 		addr = kallsyms_lookup_name("iterate_dir");
-		pr_info("ki_guard: iterate_dir=%llx\n", (unsigned long long)addr);
+		KI_LOG("drmn: iterate_dir=%llx\n", (unsigned long long)addr);
 		if (addr) {
 			hook_err_t herr = hook_wrap((void *)addr, 2,
 						    (void *)ki_iterate_before,
 						    (void *)ki_iterate_after,
 						    (void *)0);
-			pr_info("ki_guard: iterate_dir hook rc=%d\n", (int)herr);
+			KI_LOG("drmn: iterate_dir hook rc=%d\n", (int)herr);
 			if (herr == HOOK_NO_ERR)
 				ki_iter_hooked = 1;
 		} else {
-			pr_warn("ki_guard: 找不到 iterate_dir，条目仍会出现在 readdir 里\n");
+			KI_LOG("drmn: 找不到 iterate_dir，条目仍会出现在 readdir 里\n");
 		}
 	}
 
@@ -796,7 +820,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	if (ki_nsupp_want > 0)
 		ki_install_supps();
 
-	pr_info("ki_guard: active (uids=%d dirs=%d/%d hide=%d supp=%d/%d)\n",
+	KI_LOG("drmn: active (uids=%d dirs=%d/%d hide=%d supp=%d/%d)\n",
 		ki_nuids, ki_ntargets, ki_ndirs_want, ki_nhide,
 		ki_nsupp_hooked, ki_nsupp_want);
 	return 0;
@@ -810,7 +834,7 @@ static long ki_control0(const char *args, char *__user out_msg, int outlen)
 	(void)args;
 
 	ki_fill_status(status, (int)sizeof(status));
-	pr_info("ki_guard: ctl0 %s\n", status);
+	KI_LOG("drmn: ctl0 %s\n", status);
 
 	if (out_msg && outlen > 0)
 		compat_copy_to_user(out_msg, status, (int)sizeof(status));
@@ -831,7 +855,7 @@ static long ki_control1(void *a1, void *a2, void *a3)
 	(void)a3;
 
 	ki_enabled = !ki_enabled;
-	pr_info("ki_guard: ctl1 locked=%d\n", ki_enabled);
+	KI_LOG("drmn: ctl1 locked=%d\n", ki_enabled);
 	return (long)ki_enabled;
 }
 
@@ -871,7 +895,7 @@ static long ki_exit(void *__user reserved)
 	}
 	ki_nsupp_hooked = 0;
 
-	pr_info("ki_guard: unloaded (intercepts=%llu)\n",
+	KI_LOG("drmn: unloaded (intercepts=%llu)\n",
 		(unsigned long long)ki_intercepts);
 	return 0;
 }
