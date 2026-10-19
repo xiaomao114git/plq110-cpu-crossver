@@ -1,0 +1,187 @@
+name: build-ki-guard
+
+# 编译 ki_guard.ko（内核拦截层）
+#
+# 设计要点与 build-all.yml 保持一致，差异只在目标单一、目的明确：
+#   - 不使用 scripts/config 修改任何配置项。关掉 DEBUG_INFO_BTF_MODULES
+#     试图绕开 pahole，会让 struct module 从 1536 缩到 1344，设备直接拒绝。
+#   - 缺设备配置就失败，不用 defconfig 兜底 —— 兜底等于编出一个 ABI 不对的模块。
+#   - 产物校验 this_module 尺寸，然后把 __versions 做成空节（复刻 cpuinfo_spoof
+#     的跨版本加载手法），除非显式要求保留 CRC。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel:
+        description: '内核版本（需 cfg/<ver>.config）'
+        type: choice
+        options: ['6.6', '6.1', '6.12']
+        default: '6.6'
+      keep_crc:
+        description: '保留 __versions CRC 表（默认做成空节）'
+        type: boolean
+        default: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    env:
+      KVER: ${{ inputs.kernel }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 解析版本参数
+        id: v
+        run: |
+          case "$KVER" in
+            6.1)  echo "branch=android14-6.1"  >> "$GITHUB_OUTPUT"; echo "tm=1088" >> "$GITHUB_OUTPUT" ;;
+            6.6)  echo "branch=android15-6.6"  >> "$GITHUB_OUTPUT"; echo "tm=1536" >> "$GITHUB_OUTPUT" ;;
+            6.12) echo "branch=android16-6.12" >> "$GITHUB_OUTPUT"; echo "tm=1600" >> "$GITHUB_OUTPUT" ;;
+            *) echo "::error::未知版本 $KVER"; exit 1 ;;
+          esac
+          echo "cfg=ki/cfg/$KVER.config" >> "$GITHUB_OUTPUT"
+
+      - name: 检查设备配置
+        run: |
+          CFG="${{ steps.v.outputs.cfg }}"
+          if [ ! -f "$CFG" ]; then
+            echo "::error::$CFG 缺失，拒绝编 $KVER（不用 defconfig 兜底）"
+            echo "在目标设备执行: adb shell 'su -c \"zcat /proc/config.gz\"' > $CFG"
+            exit 1
+          fi
+          echo "config: $CFG"
+          echo "sha256: $(sha256sum "$CFG" | cut -d' ' -f1)"
+          wc -l "$CFG"
+
+      - name: 安装工具链
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq build-essential bc flex bison libssl-dev \
+            libelf-dev libdw-dev cmake python3 git
+          sudo apt-get install -y -qq clang-18 lld-18 llvm-18 || true
+          for t in ar nm objcopy objdump readelf strip ranlib addr2line size strings; do
+            sudo ln -sf "/usr/bin/llvm-$t-18" "/usr/bin/llvm-$t" 2>/dev/null || true
+          done
+          sudo ln -sf /usr/bin/clang-18 /usr/bin/clang 2>/dev/null || true
+          sudo ln -sf /usr/bin/ld.lld-18 /usr/bin/ld.lld 2>/dev/null || true
+          command -v clang || { echo "::error::没有可用的 clang"; exit 1; }
+          clang --version | head -1
+          ld.lld --version | head -1
+
+      - name: 确保 pahole >= 1.26
+        run: |
+          set -e
+          V=$(pahole --version 2>/dev/null | sed 's/^v//' | cut -d. -f2 || echo 0)
+          echo "pahole minor: ${V:-0}"
+          if [ "${V:-0}" -lt 26 ]; then
+            echo "::notice::pahole 过低（BTF 在 anon FWD 上会报错），源码编译 v1.27"
+            git clone --depth 1 -b v1.27 https://git.kernel.org/pub/scm/devel/pahole/pahole.git /tmp/pahole
+            mkdir -p /tmp/pahole/build
+            cd /tmp/pahole/build
+            cmake -DCMAKE_BUILD_TYPE=Release .. >/dev/null
+            make -j"$(nproc)" >/dev/null
+            sudo make install >/dev/null
+          fi
+          pahole --version
+
+      - name: 获取 GKI 源码
+        run: |
+          set -e
+          git clone --depth 1 -b "${{ steps.v.outputs.branch }}" \
+            https://android.googlesource.com/kernel/common kernel
+          echo "commit: $(git -C kernel rev-parse HEAD)"
+          grep -E '^(VERSION|PATCHLEVEL|SUBLEVEL) +=' kernel/Makefile | head -3
+
+      - name: 配置（原样使用设备配置）
+        run: |
+          set -euo pipefail
+          mkdir -p out
+          cp "${{ steps.v.outputs.cfg }}" out/.config
+          make -C kernel O=$PWD/out ARCH=arm64 LLVM=1 olddefconfig >/dev/null
+
+          echo "===== 断言布局相关配置（只读，不修改）====="
+          FAIL=0
+          check_on() {
+            if ! grep -q "^CONFIG_$1=" out/.config; then
+              echo "  [skip] CONFIG_$1 该版本无此项"
+            elif grep -q "^CONFIG_$1=y" out/.config; then
+              echo "  [OK]   CONFIG_$1=y"
+            else
+              echo "  [FAIL] CONFIG_$1 被关闭 -> struct module 布局会变"
+              FAIL=1
+            fi
+          }
+          for c in STACKTRACE_BUILD_ID DEBUG_INFO_BTF_MODULES DEBUG_INFO_BTF \
+                   DYNAMIC_DEBUG_CORE KPROBES KALLSYMS MODVERSIONS MODULE_UNLOAD \
+                   SMP CFI_CLANG ARM64_PTR_AUTH; do
+            check_on "$c"
+          done
+          grep -q '^CONFIG_LOCALVERSION="-4k"' out/.config \
+            && echo '  [OK]   LOCALVERSION=-4k' \
+            || { echo '  [FAIL] LOCALVERSION 不是 -4k'; FAIL=1; }
+          [ "$FAIL" -eq 0 ] || { echo "::error::配置前提不满足"; exit 1; }
+
+      - name: 编译 vmlinux（生成 BTF 与符号表）
+        run: |
+          set -o pipefail
+          make -C kernel O=$PWD/out ARCH=arm64 LLVM=1 -j"$(nproc)" vmlinux 2>&1 | tail -25
+
+      - name: modules_prepare 与 Module.symvers
+        run: |
+          set -e
+          make -C kernel O=$PWD/out ARCH=arm64 LLVM=1 modules_prepare 2>&1 | tail -5
+          if [ ! -s out/Module.symvers ] && [ -s out/vmlinux.symvers ]; then
+            cp out/vmlinux.symvers out/Module.symvers
+          fi
+          [ -s out/Module.symvers ] || { echo "::error::缺 Module.symvers"; exit 1; }
+          echo "Module.symvers: $(wc -l < out/Module.symvers) 条"
+
+      - name: 编译 ki_guard.ko
+        run: |
+          set -o pipefail
+          make -C out M=$PWD/ki/src ARCH=arm64 LLVM=1 \
+               CONFIG_MODULE_SIG_ALL=n modules -j2 2>&1 | tail -40
+          ls -l ki/src/ki_guard.ko
+
+      - name: 校验产物 ABI
+        run: |
+          python3 - ki/src/ki_guard.ko "${{ steps.v.outputs.tm }}" <<'PY'
+          import hashlib, re, struct, sys
+          p, expect = sys.argv[1], int(sys.argv[2])
+          d = open(p, 'rb').read()
+          h = struct.unpack_from('<16sHHIQQQIHHHHHH', d)
+          shoff, shent, shnum, shstr = h[6], h[11], h[12], h[13]
+          secs = [struct.unpack_from('<IIQQQQIIQQ', d, shoff+i*shent) for i in range(shnum)]
+          names = d[secs[shstr][4]:secs[shstr][4]+secs[shstr][5]]
+          def nm(o): return names[o:].split(b'\0',1)[0].decode()
+          info = {nm(s[0]): s for s in secs}
+          tm, ver = info.get('.gnu.linkonce.this_module'), info.get('__versions')
+          mi = d[info['.modinfo'][4]:info['.modinfo'][4]+info['.modinfo'][5]].decode('utf-8','replace')
+          print(f'  this_module = {tm[5] if tm else "MISSING"}  (期望 {expect})')
+          print(f'  __versions  = {ver[5] if ver else "MISSING"}  sh_flags=0x{ver[2]:x}' if ver else '  __versions = MISSING')
+          m = re.search(r'vermagic=([^\0]+)', mi)
+          print(f'  vermagic    = {m.group(1) if m else "MISSING"}')
+          print(f'  size        = {len(d):,}')
+          print(f'  sha256      = {hashlib.sha256(d).hexdigest()}')
+          if not tm: sys.exit('缺 .gnu.linkonce.this_module')
+          if tm[5] != expect: sys.exit(f'this_module {tm[5]} != {expect}')
+          if ver is None: sys.exit('缺 __versions 节')
+          print('  RESULT: OK')
+          PY
+
+      - name: 把 __versions 做成空节
+        if: ${{ !inputs.keep_crc }}
+        run: |
+          python3 ki/src/strip_versions.py ki/src/ki_guard.ko
+          python3 ki/src/strip_versions.py ki/src/ki_guard.ko --check
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: ki_guard-${{ inputs.kernel }}
+          path: |
+            ki/src/ki_guard.ko
+            out/.config
+          if-no-files-found: error
