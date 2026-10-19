@@ -37,9 +37,13 @@ OBJS := ki_guard_kpm.o
 
 all: ki_guard.kpm
 
+# -fuse-ld=lld 是必须的：系统 clang 默认调 /usr/bin/ld（x86_64 的 GNU ld），
+# 它不认识 aarch64 emulation，会报 "unrecognised emulation mode: aarch64linux"。
+# NDK 的 clang 自带这个默认值，系统 clang 没有。
+#
 # -r 保留重定位，KernelPatch 运行时自己做 relo
 ki_guard.kpm: $(OBJS)
-	$(CC) -r -o $@ $^
+	$(CC) -fuse-ld=lld -r -o $@ $^
 	$(STRIP) -g --strip-unneeded --strip-debug \
 		--remove-section=.comment --remove-section=.note.GNU-stack $@
 
