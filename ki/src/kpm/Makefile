@@ -35,14 +35,18 @@ CFLAGS := $(INCLUDE_FLAGS) -O2 -Wall \
 
 OBJS := ki_guard_kpm.o
 
-all: ki_guard.kpm
+# 产物名刻意不用 ki_guard：这个文件在 /data/adb 下，厂商内核态检测读得到。
+# 名字取成骁龙显示栈里常见的样子，融进背景。
+MOD := msm_drm_notify.kpm
+
+all: $(MOD)
 
 # -fuse-ld=lld 是必须的：系统 clang 默认调 /usr/bin/ld（x86_64 的 GNU ld），
 # 它不认识 aarch64 emulation，会报 "unrecognised emulation mode: aarch64linux"。
 # NDK 的 clang 自带这个默认值，系统 clang 没有。
 #
 # -r 保留重定位，KernelPatch 运行时自己做 relo
-ki_guard.kpm: $(OBJS)
+$(MOD): $(OBJS)
 	$(CC) -fuse-ld=lld -r -o $@ $^
 	$(STRIP) -g --strip-unneeded --strip-debug \
 		--remove-section=.comment --remove-section=.note.GNU-stack $@
@@ -51,6 +55,6 @@ ki_guard_kpm.o: ki_guard_kpm.c ki_guard_kpm.lds
 	$(CC) $(CFLAGS) -T ki_guard_kpm.lds -c -o $@ $<
 
 clean:
-	rm -f $(OBJS) ki_guard.kpm
+	rm -f $(OBJS) $(MOD)
 
 .PHONY: all clean
