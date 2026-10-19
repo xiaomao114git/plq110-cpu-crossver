@@ -44,7 +44,15 @@ jobs:
         run: |
           sudo apt-get update -qq
           sudo apt-get install -y -qq build-essential bc flex bison libssl-dev \
-            libelf-dev gcc-aarch64-linux-gnu python3 dwarves
+            libelf-dev gcc-aarch64-linux-gnu python3 dwarves \
+            clang-18 lld-18 llvm-18
+          # 目标设备用 Android Clang 18.0.0，CI 必须同族工具链，
+          # 否则 struct module 等结构体布局可能与真机不一致。
+          sudo ln -sf /usr/bin/clang-18 /usr/bin/clang || true
+          sudo ln -sf /usr/bin/ld.lld-18 /usr/bin/ld.lld || true
+          echo "=== 工具链 ==="
+          clang --version | head -1
+          ld.lld --version | head -1
 
       - name: 缓存内核源码
         uses: actions/cache@v4
@@ -76,10 +84,10 @@ jobs:
             if [ -f "$DEVCFG" ]; then
               echo "使用设备真实配置: $DEVCFG"
               cp "$DEVCFG" out/.config
-              make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+              make -C kernel O=$PWD/out ARCH=arm64 LLVM=1 olddefconfig
             else
               echo "无设备配置，回退 defconfig"
-              make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+              make -C kernel O=$PWD/out ARCH=arm64 LLVM=1 defconfig
             fi
             # 目标设备 CONFIG_MODVERSIONS=y，CI 必须一致，否则 .ko 里不会有 __versions 段，
             # 加载时 check_version 会走 try_to_force_load() 返回 -ENOEXEC。
@@ -87,7 +95,7 @@ jobs:
             ./kernel/scripts/config --file out/.config -d DEBUG_INFO_NONE
             ./kernel/scripts/config --file out/.config -e DEBUG_INFO -e DEBUG_INFO_DWARF4
             ./kernel/scripts/config --file out/.config --set-str LOCALVERSION ''
-            make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- olddefconfig
+            make -C kernel O=$PWD/out ARCH=arm64 LLVM=1 olddefconfig
             echo "== DEBUG_INFO 配置 =="
             grep -E "CONFIG_DEBUG_INFO" out/.config | head -8
             grep -q "CONFIG_DEBUG_INFO=y" out/.config || { echo "::error::DEBUG_INFO 未开"; exit 1; }
@@ -98,7 +106,7 @@ jobs:
       - name: 编译内核取 vmlinux
         run: |
           set -o pipefail
-          make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+          make -C kernel O=$PWD/out ARCH=arm64 LLVM=1 \
             -j$(nproc) vmlinux 2>&1 | tee vmlinux-full.log
           RC=$?
           echo "make 退出码: $RC"
@@ -118,7 +126,7 @@ jobs:
           # 编模块需要它，缺了会报：No rule to make target scripts/module.lds
           # 注意 modules_prepare 不会生成 Module.symvers（那个要完整构建），
           # 但这轮用 --no-crc 路径，本来就不需要 CRC 表。
-          make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- modules_prepare 2>&1 | tail -10
+          make -C kernel O=$PWD/out ARCH=arm64 LLVM=1 modules_prepare 2>&1 | tail -10
           echo ""
           echo "=== 关键构建文件 ==="
           for f in scripts/module.lds include/generated/autoconf.h include/config/auto.conf include/generated/asm-offsets.h; do
@@ -208,7 +216,7 @@ jobs:
           echo "Module.symvers: $(wc -l < out/Module.symvers) 行"
 
           set +e
-          make -C out "M=$PWD/src" ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- \
+          make -C out "M=$PWD/src" ARCH=arm64 LLVM=1 \
                CONFIG_MODULE_SIG_ALL=n "KCFLAGS=$KCF" \
                V=1 --output-sync=target modules -j2 2>&1 | tee module-build.log
           RC=${PIPESTATUS[0]}
