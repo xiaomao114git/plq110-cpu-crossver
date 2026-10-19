@@ -1,0 +1,80 @@
+name: build-ki-kpm
+
+# 编译 ki_guard.kpm（内核拦截层的 KernelPatch Module）
+#
+# 与 build-ki.yml 的根本区别：这里不编内核、不编 vmlinux、不需要设备配置、
+# 不需要 pahole。KPM 不走 kernel/module 的加载路径，所以 struct module 尺寸、
+# 符号 CRC、vermagic 三道关卡全都不适用 —— 一个产物覆盖所有装了 KernelPatch
+# 的 aarch64 设备。
+#
+# 只需要：clang(lld) + KernelPatch 的 kernel/ 头文件。
+
+on:
+  workflow_dispatch:
+    inputs:
+      kp_ref:
+        description: 'KernelPatch 分支/tag'
+        type: string
+        default: 'main'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装工具链
+        run: |
+          set -e
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq clang lld llvm make git
+          clang --version | head -1
+          llvm-strip --version | head -1
+          make --version | head -1
+
+      - name: 拉 KernelPatch 头文件
+        run: |
+          set -e
+          git clone --depth 1 --filter=blob:none --sparse \
+            -b "${{ inputs.kp_ref }}" \
+            https://github.com/bmax121/KernelPatch.git kp
+          cd kp
+          git sparse-checkout set kernel
+          echo "commit: $(git rev-parse HEAD)"
+          ls kernel/include | head -20
+
+      - name: 编译 KPM
+        run: |
+          set -e
+          cd ki/src/kpm
+          make KP_DIR="$GITHUB_WORKSPACE/kp" 2>&1 | tee /tmp/build.log
+          ls -l ki_guard.kpm
+
+      - name: 校验产物是合法 KPM
+        run: |
+          set -e
+          f=ki/src/kpm/ki_guard.kpm
+          echo "size: $(wc -c < $f) B"
+          readelf -h "$f" | grep -E 'Class|Machine|Type'
+          echo "--- KPM 专属节 ---"
+          readelf -S "$f" | grep -E '\.kpm' || {
+            echo "::error::没有 .kpm.info 节，不是合法 KPM"; exit 1; }
+          echo "--- KPM 约定符号 ---"
+          readelf -sW "$f" | grep -E '__kpm_' || {
+            echo "::error::没有 __kpm_* 符号"; exit 1; }
+          # 必须导出 init，否则运行时不认
+          readelf -sW "$f" | grep -q '__kpm_init' \
+            && echo "OK __kpm_init" \
+            || { echo "::error::缺 __kpm_init"; exit 1; }
+          echo "--- 引用到的内核符号 ---"
+          readelf -sW "$f" | awk '$7=="UND"{print "  " $8}' | head -30
+          echo "sha256: $(sha256sum $f | cut -d' ' -f1)"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ki_guard-kpm
+          path: |
+            ki/src/kpm/ki_guard.kpm
+            /tmp/build.log
+          if-no-files-found: error
