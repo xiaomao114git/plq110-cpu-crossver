@@ -71,6 +71,9 @@ jobs:
             # 只需要 DEBUG_INFO=y —— 后面用 pahole -J 从 DWARF 直接生成 .BTF 段，
             # 完全不碰 DEBUG_INFO_BTF 那条 Kconfig 依赖链（它依赖 PAHOLE_VERSION 探测）。
             make -C kernel O=$PWD/out ARCH=arm64 CROSS_COMPILE=aarch64-linux-gnu- defconfig
+            # 目标设备 CONFIG_MODVERSIONS=y，CI 必须一致，否则 .ko 里不会有 __versions 段，
+            # 加载时 check_version 会走 try_to_force_load() 返回 -ENOEXEC。
+            ./kernel/scripts/config --file out/.config -e MODVERSIONS
             ./kernel/scripts/config --file out/.config -d DEBUG_INFO_NONE
             ./kernel/scripts/config --file out/.config -e DEBUG_INFO -e DEBUG_INFO_DWARF4
             ./kernel/scripts/config --file out/.config --set-str LOCALVERSION ''
@@ -78,6 +81,7 @@ jobs:
             echo "== DEBUG_INFO 配置 =="
             grep -E "CONFIG_DEBUG_INFO" out/.config | head -8
             grep -q "CONFIG_DEBUG_INFO=y" out/.config || { echo "::error::DEBUG_INFO 未开"; exit 1; }
+            grep -q "CONFIG_MODVERSIONS=y" out/.config || { echo "::error::MODVERSIONS 未开，产物无 __versions 段"; exit 1; }
             echo "== pahole =="
             command -v pahole || { echo "::error::缺 pahole"; exit 1; }
             pahole --version
