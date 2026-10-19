@@ -80,6 +80,35 @@ static uint64_t ki_intercepts;
 /* 被替换掉的函数，卸载时要逐个 unhook */
 static uint64_t ki_supp_funcs[KI_MAX_SUPP];
 
+/* ---- 按需锁定 ---- */
+static int ki_enabled = 1;          /* ctl1 切；相当于原版的 lock/unlock */
+
+/* ---- 目录条目隐藏 ---- */
+/*
+ * 原版靠替换 inode_operations 让条目从 readdir 结果里消失。这里不改那个
+ * 只读结构，改成在 iterate_dir 里换掉 ctx->actor：dir_context 是调用方栈上
+ * 的结构，可写，风险低得多。
+ *
+ * 6.1+ 的 actor 返回 bool（true = 继续遍历），KernelPatch 的 dir_context 已经
+ * 按这个签名声明。旧的 int 版本语义相反，需要 dir_context_int。
+ */
+typedef bool (*ki_filldir_t)(struct dir_context *, const char *, int, loff_t,
+			     u64, unsigned int);
+
+#define KI_MAX_ITER 16
+struct ki_iter_slot {
+	uint64_t ctx;
+	uint64_t saved;
+	int used;
+};
+static struct ki_iter_slot ki_iter_slots[KI_MAX_ITER];
+
+static uint64_t ki_parent_dentry[KI_MAX_DIRS];
+static char ki_hide_name[KI_MAX_DIRS][64];
+static int ki_nhide;
+
+static long off_file_path = -1;
+
 /* ---------------- BTF 偏移 ---------------- */
 
 static long off_inode_sb = -1;
@@ -341,6 +370,7 @@ static void ki_perm_before(hook_fargs3_t *fargs, void *udata)
 }
 
 static int ki_hooked;
+static int ki_iter_hooked;
 
 /* ---------------- 厂商上报压制 ---------------- */
 
@@ -390,6 +420,201 @@ static void ki_install_supps(void)
 	}
 }
 
+/* ---------------- 目录条目隐藏 ---------------- */
+
+static int ki_split_path(const char *full, char *parent, int plen,
+			 char *leaf, int llen)
+{
+	int n = 0, cut = -1, i, k;
+
+	while (full[n])
+		n++;
+	for (i = n - 1; i >= 0; i--) {
+		if (full[i] == '/') {
+			cut = i;
+			break;
+		}
+	}
+	if (cut <= 0 || cut >= plen)
+		return -1;
+
+	for (i = 0; i < cut; i++)
+		parent[i] = full[i];
+	parent[cut] = '\0';
+
+	k = n - cut - 1;
+	if (k <= 0 || k >= llen)
+		return -1;
+	for (i = 0; i < k; i++)
+		leaf[i] = full[cut + 1 + i];
+	leaf[k] = '\0';
+	return 0;
+}
+
+/*
+ * 预解析每个目标目录的父目录 dentry，并记下要过滤掉的项名。
+ * 比较 dentry 指针而不是每次拼路径，hook 里的开销才是常数级。
+ */
+static void ki_prepare_hide(void)
+{
+	int i, ok = 0;
+
+	ki_nhide = 0;
+	if (off_path_dentry < 0 || !ki_kern_path)
+		return;
+
+	for (i = 0; i < ki_ndirs_want && ok < KI_MAX_DIRS; i++) {
+		char parent[160];
+		char leaf[64];
+		uint64_t pathbuf[3];
+		uint64_t dentry;
+		int j = 0;
+
+		if (ki_split_path(ki_dir_specs[i], parent, (int)sizeof(parent),
+				  leaf, (int)sizeof(leaf)))
+			continue;
+
+		pathbuf[0] = 0;
+		pathbuf[1] = 0;
+		pathbuf[2] = 0;
+		if (ki_kern_path(parent, KI_LOOKUP_FOLLOW, pathbuf) != 0)
+			continue;
+
+		dentry = *(uint64_t *)((char *)pathbuf + off_path_dentry);
+		if (!dentry)
+			continue;
+
+		ki_parent_dentry[ok] = dentry;
+		while (leaf[j] && j < (int)sizeof(ki_hide_name[0]) - 1) {
+			ki_hide_name[ok][j] = leaf[j];
+			j++;
+		}
+		ki_hide_name[ok][j] = '\0';
+
+		pr_info("ki_guard: hide entry '%s' under parent dentry=%llx\n",
+			ki_hide_name[ok], (unsigned long long)dentry);
+		ok++;
+	}
+	ki_nhide = ok;
+}
+
+static int ki_name_is_hidden(const char *name, int namelen)
+{
+	int i, j;
+
+	for (i = 0; i < ki_nhide; i++) {
+		if (!ki_hide_name[i][0])
+			continue;
+		for (j = 0; j < namelen; j++) {
+			if (ki_hide_name[i][j] != name[j])
+				break;
+		}
+		if (j == namelen && ki_hide_name[i][j] == '\0')
+			return 1;
+	}
+	return 0;
+}
+
+static int ki_iter_slot_index(uint64_t ctx)
+{
+	int i;
+
+	for (i = 0; i < KI_MAX_ITER; i++) {
+		if (ki_iter_slots[i].used && ki_iter_slots[i].ctx == ctx)
+			return i;
+	}
+	return -1;
+}
+
+static bool ki_actor(struct dir_context *ctx, const char *name, int namelen,
+		     loff_t offset, u64 ino, unsigned int d_type)
+{
+	ki_filldir_t saved = (ki_filldir_t)0;
+	int i;
+
+	for (i = 0; i < KI_MAX_ITER; i++) {
+		if (ki_iter_slots[i].used && ki_iter_slots[i].ctx == (u64)ctx) {
+			saved = (ki_filldir_t)ki_iter_slots[i].saved;
+			break;
+		}
+	}
+	if (!saved)
+		return true;
+
+	/* 命中要隐藏的项：不转发给原 actor，条目就不会出现在结果里。
+	 * 返回 true 是"继续遍历"，不是"失败"——6.1+ 的 actor 语义。 */
+	if (name && namelen > 0 && ki_name_is_hidden(name, namelen))
+		return true;
+
+	return saved(ctx, name, namelen, offset, ino, d_type);
+}
+
+static void ki_iterate_before(hook_fargs2_t *fargs, void *udata)
+{
+	struct file *file = (struct file *)fargs->arg0;
+	struct dir_context *ctx = (struct dir_context *)fargs->arg1;
+	uint64_t dentry, ctxkey;
+	int i, slot = -1;
+
+	(void)udata;
+
+	if (!ki_enabled || ki_nhide <= 0 || off_file_path < 0)
+		return;
+	if (!ctx || !ctx->actor)
+		return;
+	if (!ki_uid_hit())
+		return;
+
+	dentry = *(uint64_t *)((char *)file + off_file_path + off_path_dentry);
+	if (!dentry)
+		return;
+
+	for (i = 0; i < ki_nhide; i++) {
+		if (ki_parent_dentry[i] && ki_parent_dentry[i] == dentry)
+			break;
+	}
+	if (i >= ki_nhide)
+		return;   /* 不是在遍历被隐藏目录的父目录 */
+
+	ctxkey = (uint64_t)ctx;
+	if (ki_iter_slot_index(ctxkey) >= 0)
+		return;   /* 已经换过，别重复包装 */
+
+	for (i = 0; i < KI_MAX_ITER; i++) {
+		if (!ki_iter_slots[i].used) {
+			slot = i;
+			break;
+		}
+	}
+	if (slot < 0)
+		return;
+
+	ki_iter_slots[slot].ctx = ctxkey;
+	ki_iter_slots[slot].saved = (uint64_t)ctx->actor;
+	ki_iter_slots[slot].used = 1;
+	ctx->actor = ki_actor;
+}
+
+static void ki_iterate_after(hook_fargs2_t *fargs, void *udata)
+{
+	struct dir_context *ctx = (struct dir_context *)fargs->arg1;
+	int slot;
+
+	(void)udata;
+
+	if (!ctx)
+		return;
+
+	slot = ki_iter_slot_index((uint64_t)ctx);
+	if (slot < 0)
+		return;
+
+	ctx->actor = (ki_filldir_t)ki_iter_slots[slot].saved;
+	ki_iter_slots[slot].used = 0;
+	ki_iter_slots[slot].ctx = 0;
+	ki_iter_slots[slot].saved = 0;
+}
+
 /* ---------------- 状态 ---------------- */
 
 static void ki_fill_status(char *out, int outlen)
@@ -422,6 +647,8 @@ static void ki_fill_status(char *out, int outlen)
 
 	KI_PUTS("hooked=");
 	KI_PUTU(ki_hooked);
+	KI_PUTS(" locked=");
+	KI_PUTU(ki_enabled);
 	KI_PUTS(" uids=");
 	for (i = 0; i < ki_nuids; i++) {
 		if (i)
@@ -432,6 +659,10 @@ static void ki_fill_status(char *out, int outlen)
 	KI_PUTU(ki_ntargets);
 	KI_PUTS("/");
 	KI_PUTU(ki_ndirs_want);
+	KI_PUTS(" hide=");
+	KI_PUTU(ki_nhide);
+	KI_PUTS(" iter=");
+	KI_PUTU(ki_iter_hooked);
 	KI_PUTS(" supp=");
 	KI_PUTU(ki_nsupp_hooked);
 	KI_PUTS("/");
@@ -465,8 +696,11 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	ki_ntargets = 0;
 	ki_nsupp_want = 0;
 	ki_nsupp_hooked = 0;
+	ki_nhide = 0;
 	ki_intercepts = 0;
 	ki_hooked = 0;
+	ki_iter_hooked = 0;
+	ki_enabled = 1;
 
 	if (args && ki_take_value(args, "uids", &val, &len))
 		ki_nuids = ki_parse_u32_list(val, val + len, ki_uids, KI_MAX_UIDS);
@@ -495,9 +729,11 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	off_inode_ino = kp_btf_member_offset("inode", "i_ino");
 	off_path_dentry = kp_btf_member_offset("path", "dentry");
 	off_dentry_inode = kp_btf_member_offset("dentry", "d_inode");
+	off_file_path = kp_btf_member_offset("file", "f_path");
 
-	pr_info("ki_guard: off inode.i_sb=%ld inode.i_ino=%ld path.dentry=%ld dentry.d_inode=%ld\n",
-		off_inode_sb, off_inode_ino, off_path_dentry, off_dentry_inode);
+	pr_info("ki_guard: off inode.i_sb=%ld inode.i_ino=%ld path.dentry=%ld dentry.d_inode=%ld file.f_path=%ld\n",
+		off_inode_sb, off_inode_ino, off_path_dentry, off_dentry_inode,
+		off_file_path);
 
 	if (!ki_btf_offsets_ok()) {
 		pr_err("ki_guard: BTF 取不到 inode 偏移，无法工作（内核缺 BTF?）\n");
@@ -513,6 +749,10 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 
 		ki_resolve_dirs();
 		pr_info("ki_guard: resolved %d/%d dirs\n", ki_ntargets, ki_ndirs_want);
+
+		/* 目录条目隐藏需要父目录 dentry；与上面共用同一次解析结果 */
+		ki_prepare_hide();
+		pr_info("ki_guard: hide entries prepared %d\n", ki_nhide);
 	}
 
 	/* 挂 inode_permission */
@@ -535,12 +775,29 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 
 	ki_hooked = 1;
 
+	/* 目录条目隐藏：hook iterate_dir，换 ctx->actor 过滤掉目标项 */
+	if (ki_nhide > 0) {
+		addr = kallsyms_lookup_name("iterate_dir");
+		pr_info("ki_guard: iterate_dir=%llx\n", (unsigned long long)addr);
+		if (addr) {
+			hook_err_t herr = hook_wrap((void *)addr, 2,
+						    (void *)ki_iterate_before,
+						    (void *)ki_iterate_after,
+						    (void *)0);
+			pr_info("ki_guard: iterate_dir hook rc=%d\n", (int)herr);
+			if (herr == HOOK_NO_ERR)
+				ki_iter_hooked = 1;
+		} else {
+			pr_warn("ki_guard: 找不到 iterate_dir，条目仍会出现在 readdir 里\n");
+		}
+	}
+
 	/* 厂商上报压制：符号不存在属正常，逐个记录不阻塞 */
 	if (ki_nsupp_want > 0)
 		ki_install_supps();
 
-	pr_info("ki_guard: active (uids=%d dirs=%d/%d supp=%d/%d)\n",
-		ki_nuids, ki_ntargets, ki_ndirs_want,
+	pr_info("ki_guard: active (uids=%d dirs=%d/%d hide=%d supp=%d/%d)\n",
+		ki_nuids, ki_ntargets, ki_ndirs_want, ki_nhide,
 		ki_nsupp_hooked, ki_nsupp_want);
 	return 0;
 }
@@ -561,18 +818,21 @@ static long ki_control0(const char *args, char *__user out_msg, int outlen)
 	return 0;
 }
 
-/* kpatch kpm ctl1 —— 重新解析目录（分区后挂载时用） */
+/* kpatch kpm ctl1 <name> —— lock/unlock 切换
+ *
+ * 对应原版的按需锁定：目标应用运行时 lock，退出后 unlock。
+ * 关掉时 hook 仍在，但 ki_enabled=0 让两个回调立即放行，
+ * 效果等价于撤销，且不需要反复重挂（重挂有窗口，还有失败风险）。
+ */
 static long ki_control1(void *a1, void *a2, void *a3)
 {
-	int n;
-
 	(void)a1;
 	(void)a2;
 	(void)a3;
 
-	n = ki_resolve_dirs();
-	pr_info("ki_guard: ctl1 re-resolve -> %d/%d\n", n, ki_ndirs_want);
-	return n;
+	ki_enabled = !ki_enabled;
+	pr_info("ki_guard: ctl1 locked=%d\n", ki_enabled);
+	return (long)ki_enabled;
 }
 
 static long ki_exit(void *__user reserved)
@@ -582,13 +842,19 @@ static long ki_exit(void *__user reserved)
 
 	(void)reserved;
 
-	/* 先撤抑制，再撤主 hook：反过来会让抑制窗口短暂悬空 */
-	for (i = 0; i < ki_nsupp_hooked; i++) {
-		if (ki_supp_funcs[i])
-			unhook((void *)ki_supp_funcs[i]);
-		ki_supp_funcs[i] = 0;
+	/* 撤的顺序：条目过滤 -> 主 hook -> 抑制。
+	 * 先撤过滤是因为它依赖 iterate_dir 的包装状态，晚了会留下悬空 actor。 */
+	if (ki_iter_hooked) {
+		addr = kallsyms_lookup_name("iterate_dir");
+		if (addr)
+			unhook((void *)addr);
+		ki_iter_hooked = 0;
 	}
-	ki_nsupp_hooked = 0;
+	for (i = 0; i < KI_MAX_ITER; i++) {
+		ki_iter_slots[i].used = 0;
+		ki_iter_slots[i].ctx = 0;
+		ki_iter_slots[i].saved = 0;
+	}
 
 	if (ki_hooked) {
 		addr = kallsyms_lookup_name("inode_permission");
@@ -596,6 +862,14 @@ static long ki_exit(void *__user reserved)
 			unhook((void *)addr);
 		ki_hooked = 0;
 	}
+
+	/* 最后撤抑制：让上报通道恢复得比拦截晚一点，避免中间窗口漏事件 */
+	for (i = 0; i < ki_nsupp_hooked; i++) {
+		if (ki_supp_funcs[i])
+			unhook((void *)ki_supp_funcs[i]);
+		ki_supp_funcs[i] = 0;
+	}
+	ki_nsupp_hooked = 0;
 
 	pr_info("ki_guard: unloaded (intercepts=%llu)\n",
 		(unsigned long long)ki_intercepts);
