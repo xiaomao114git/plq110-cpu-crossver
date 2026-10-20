@@ -1,0 +1,40 @@
+name: build-issuer-apk
+
+# 打包发卡器 APK（PLQ3 / Ed25519）。
+# 先跑 RFC 8032 自检，再打 APK —— 密码学错了一律不出包。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'issuer-apk/**'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          ls -d "$ANDROID_HOME"/build-tools/* | sort -V | tail -1
+          ls -d "$ANDROID_HOME"/platforms/android-* | sort -V | tail -1
+          java -version 2>&1 | head -1
+
+      - name: 打包
+        working-directory: issuer-apk
+        run: |
+          set -euo pipefail
+          chmod +x build.sh
+          ./build.sh 2>&1 | tee /tmp/apk-build.log
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: issuer-apk
+          path: |
+            issuer-apk/issuer-plq3.apk
+            /tmp/apk-build.log
+          if-no-files-found: error
