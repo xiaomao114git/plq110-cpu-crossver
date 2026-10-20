@@ -52,7 +52,7 @@ $(MOD): $(OBJS)
 	$(STRIP) -g --strip-unneeded --strip-debug \
 		--remove-section=.comment --remove-section=.note.GNU-stack $@
 
-ki_guard_kpm.o: ki_guard_kpm.c ki_guard_kpm.lds Makefile
+ki_guard_kpm.o: ki_guard_kpm.c ki_guard_kpm.lds ki_cpuinfo_gen.h Makefile
 	$(CC) $(CFLAGS) -T ki_guard_kpm.lds -c -o $@ $<
 
 clean:

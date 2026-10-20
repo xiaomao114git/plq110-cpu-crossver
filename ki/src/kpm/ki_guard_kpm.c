@@ -419,6 +419,127 @@ static void ki_readlink_before(hook_fargs3_t *fargs, void *udata)
 	ki_readlinks++;
 }
 
+/* ---------------- /proc/cpuinfo 伪装 ---------------- */
+
+/* cpuinfo 文本编译进 .rodata（命令行传不下 3~7 KB）。自动生成。 */
+#include "ki_cpuinfo_gen.h"
+
+/*
+ * 从 cpuinfo_spoof.ko 搬过来。原模块用 kprobe 在 seq_open 前置 hook，
+ * 把第二个参数（op 表）换成自己的 seq_operations。这里用 KPM 做同样的事，
+ * 好处是不再需要 .ko 的 vermagic / struct module 尺寸 / 符号 CRC 三道关卡，
+ * 一个 KPM 覆盖所有内核版本。
+ *
+ * seq_open(struct file *file, const struct seq_operations *op)
+ *   arg0 = file，arg1 = op —— 改 arg1 即可，不需要碰文件内容。
+ *
+ * 唯一的偏移依赖在 is_cpuinfo()：要读 file->f_path.dentry->d_name 判断文件名。
+ * 这三个结构体布局从 4.x 到 6.12 都没变过，直接用常量；读取前做边界检查，
+ * 偏移若不符也只会静默跳过，不会崩。
+ */
+struct ki_seqops {
+	void *(*start)(void *m, void *pos);
+	void (*stop)(void *m, void *v);
+	void *(*next)(void *m, void *v, void *pos);
+	int (*show)(void *m, void *v);
+};
+
+/* struct file / path / dentry / qstr 的固定偏移（64 位） */
+#define KI_OFF_FILE_FPATH      16   /* struct file.f_path */
+#define KI_OFF_PATH_DENTRY     8    /* struct path.dentry */
+#define KI_OFF_DENTRY_DNAME    32   /* struct dentry.d_name */
+#define KI_OFF_QSTR_LEN        4    /* struct qstr: hash(4) + len(4) */
+#define KI_OFF_QSTR_NAME       8    /* struct qstr.name */
+
+/* 内核地址下界：低于此值一律视为无效指针，避免野指针读取 */
+#define KI_KADDR_MIN 0xffff000000000000ULL
+
+static void *(*ki_seq_puts)(void *m, const char *s);
+static struct ki_seqops ki_cpuinfo_ops;
+static const char *ki_cpuinfo_text;
+static int ki_cpu_enabled;
+static int ki_hooked_cpu;
+static uint64_t ki_cpu_hits;
+static uint64_t ki_cpu_scanned;
+
+static void *ki_sp_start(void *m, void *pos)
+{
+	(void)m;
+	return *(loff_t *)pos == 0 ? (void *)1 : 0;
+}
+
+static void ki_sp_stop(void *m, void *v)
+{
+	(void)m;
+	(void)v;
+}
+
+static void *ki_sp_next(void *m, void *v, void *pos)
+{
+	(void)m;
+	(void)v;
+	++*(loff_t *)pos;
+	return 0;
+}
+
+static int ki_sp_show(void *m, void *v)
+{
+	(void)v;
+	if (ki_seq_puts && ki_cpuinfo_text)
+		ki_seq_puts(m, ki_cpuinfo_text);
+	return 0;
+}
+
+static int ki_is_cpuinfo(uint64_t file)
+{
+	uint64_t dentry, name;
+	uint32_t len;
+	int i;
+
+	if (file < KI_KADDR_MIN)
+		return 0;
+
+	dentry = *(volatile uint64_t *)(file + KI_OFF_FILE_FPATH + KI_OFF_PATH_DENTRY);
+	if (dentry < KI_KADDR_MIN)
+		return 0;
+
+	len = *(volatile uint32_t *)(dentry + KI_OFF_DENTRY_DNAME + KI_OFF_QSTR_LEN);
+	if (len != 7)
+		return 0;
+
+	name = *(volatile uint64_t *)(dentry + KI_OFF_DENTRY_DNAME + KI_OFF_QSTR_NAME);
+	if (name < KI_KADDR_MIN)
+		return 0;
+
+	{
+		const char *p = (const char *)name;
+		static const char want[7] = { 'c', 'p', 'u', 'i', 'n', 'f', 'o' };
+
+		for (i = 0; i < 7; i++) {
+			if (p[i] != want[i])
+				return 0;
+		}
+	}
+	return 1;
+}
+
+static void ki_seqopen_before(hook_fargs3_t *fargs, void *udata)
+{
+	(void)udata;
+
+	if (!ki_enabled || !ki_cpu_enabled)
+		return;
+	if (!ki_cpuinfo_text)
+		return;
+
+	ki_cpu_scanned++;
+	if (!ki_is_cpuinfo(fargs->arg0))
+		return;
+
+	fargs->arg1 = (uint64_t)&ki_cpuinfo_ops;
+	ki_cpu_hits++;
+}
+
 static int ki_hooked_open;
 static int ki_hooked_lookup;
 static int ki_hooked_mutate;
@@ -561,6 +682,12 @@ static int ki_fill_status(char *out, int outlen)
 	KI_PUTU(ki_mutates);
 	KI_PUTS(" rl_hit=");
 	KI_PUTU(ki_readlinks);
+	KI_PUTS(" cpu=");
+	KI_PUTU(ki_hooked_cpu);
+	KI_PUTS(" cpu_hit=");
+	KI_PUTU(ki_cpu_hits);
+	KI_PUTS(" cpu_scan=");
+	KI_PUTU(ki_cpu_scanned);
 	KI_PUTS(" full=");
 	KI_PUTU(ki_hook_full);
 	out[n] = '\0';
@@ -788,6 +915,9 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	ki_lookups = 0;
 	ki_mutates = 0;
 	ki_readlinks = 0;
+	ki_cpu_hits = 0;
+	ki_cpu_scanned = 0;
+	ki_hooked_cpu = 0;
 	ki_hooked_open = 0;
 	ki_hooked_lookup = 0;
 	ki_hooked_mutate = 0;
@@ -821,6 +951,23 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 		if (len >= 4 && val[0] == 'f' && val[1] == 'u' &&
 		    val[2] == 'l' && val[3] == 'l')
 			ki_hook_full = 1;
+	}
+
+	/*
+	 * CPU 伪装档位：cpu=8t / cpu=16t / cpu=0（默认关）。
+	 * 文本编译进 .rodata，这里只选指针。默认关是为了向后兼容——
+	 * 老调用方式不传 cpu 就完全不受影响。
+	 */
+	ki_cpu_enabled = 0;
+	ki_cpuinfo_text = 0;
+	if (args && ki_take_value(args, "cpu", &val, &len) && len >= 2) {
+		if (val[0] == '8' && val[1] == 't') {
+			ki_cpuinfo_text = ki_cpuinfo_8t;
+			ki_cpu_enabled = 1;
+		} else if (val[0] == '1' && val[1] == '6') {
+			ki_cpuinfo_text = ki_cpuinfo_16t;
+			ki_cpu_enabled = 1;
+		}
 	}
 
 	KI_LOG("drmn: uids=%d dirs=%d supp=%d\n", ki_nuids, ki_ndirs_want, ki_nsupp_want);
@@ -1006,9 +1153,44 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 		KI_LOG("drmn: hooks=core，只挂 2 个主 hook\n");
 	}
 
+	/*
+	 * CPU 伪装：hook seq_open，把 op 表换成自己的。
+	 * 与 KI/目录拦截相互独立——即使主 hook 失败，CPU 伪装只要能挂上
+	 * 就应该继续工作，所以这段放在「主 hook 全失败就退出」之前。
+	 */
+	if (ki_cpu_enabled) {
+		ki_seq_puts = (void *(*)(void *, const char *))
+			kallsyms_lookup_name("seq_puts");
+		ki_cpuinfo_ops.start = (void *(*)(void *, void *))ki_sp_start;
+		ki_cpuinfo_ops.stop = (void (*)(void *, void *))ki_sp_stop;
+		ki_cpuinfo_ops.next = (void *(*)(void *, void *, void *))ki_sp_next;
+		ki_cpuinfo_ops.show = (int (*)(void *, void *))ki_sp_show;
+
+		KI_LOG("drmn: seq_puts=%llx\n", (unsigned long long)(uintptr_t)ki_seq_puts);
+		if (!ki_seq_puts) {
+			KI_ERR("drmn: 找不到 seq_puts，CPU 伪装无法输出\n");
+			ki_cpu_enabled = 0;
+		} else {
+			addr = kallsyms_lookup_name("seq_open");
+			KI_LOG("drmn: seq_open=%llx\n", (unsigned long long)addr);
+			if (addr) {
+				herr = ki_register_wrap((void *)addr, 2,
+						 (void *)ki_seqopen_before, (void *)0, (void *)0);
+				KI_LOG("drmn: seq_open hook rc=%d\n", (int)herr);
+				if (herr == HOOK_NO_ERR)
+					ki_hooked_cpu = 1;
+			}
+			if (!ki_hooked_cpu) {
+				KI_ERR("drmn: seq_open 挂不上，CPU 伪装停用\n");
+				ki_cpu_enabled = 0;
+			}
+		}
+	}
+
 	if (!ki_hooked_open && !ki_hooked_lookup) {
 		ki_enabled = 0;
 		ki_unregister_wraps();
+		ki_cpu_enabled = 0;
 		KI_ERR("drmn: 两个主 hook 点都挂不上，无法工作\n");
 		return -EIO;
 	}
@@ -1016,9 +1198,9 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	if (ki_nsupp_want > 0)
 		ki_install_supps();
 
-	KI_LOG("drmn: active (uids=%d dirs=%d open=%d lookup=%d supp=%d/%d)\n",
+	KI_LOG("drmn: active (uids=%d dirs=%d open=%d lookup=%d supp=%d/%d cpu=%d)\n",
 		ki_nuids, ki_ndirs_want, ki_hooked_open, ki_hooked_lookup,
-		ki_nsupp_hooked, ki_nsupp_want);
+		ki_nsupp_hooked, ki_nsupp_want, ki_hooked_cpu);
 	return 0;
 }
 
