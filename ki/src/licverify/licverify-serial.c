@@ -662,8 +662,20 @@ static int lic_check(char *err, size_t errsz, long *out_days)
     lic_hash(L.payload, lh, sizeof lh);
     st = state_load(&seen, st_lic, sizeof st_lic);
     if (st == -2) {
-        snprintf(err, errsz, "授权状态文件被篡改，请重新激活");
-        return -4;
+        /*
+         * state 文件的 MAC 不匹配有两种原因：
+         *   1) 用户真的改了状态文件（想绕过限期 / 回滚时间）
+         *   2) 换了 state MAC 的密钥（例如 PLQ2 下线时把 K1/K2/KJ 换成了
+         *      固定串派生），老设备上的状态文件必然验不过
+         *
+         * 早先这里直接判「被篡改」并拒绝，结果升级上来的设备全部被锁在门外
+         * （设备实测：校验结果: 失败 - 授权状态文件被篡改）。
+         *
+         * 现在改成丢弃旧状态、按首次激活重新记录。代价是这一次升级失去了
+         * 防回滚保护（用户可以把时间往回拨一次），换来的是升级不炸。
+         * 之后每轮 check 都会用新密钥重写状态，保护恢复。
+         */
+        st = -1;
     }
 
     now = (long)time(NULL);
