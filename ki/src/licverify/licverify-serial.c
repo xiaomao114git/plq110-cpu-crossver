@@ -29,6 +29,9 @@
 #include <sys/stat.h>
 #include <sys/types.h>
 
+/* PLQ3 验签用（orlp/ed25519，用户态有 libc，直接编进来） */
+#include "ed25519/ed25519.h"
+
 #define LIC_DIR_DEFAULT "/data/adb/plq110-lic"
 #define LIC_FILE_NAME   "/license.txt"
 #define ST_FILE_NAME    "/state"
@@ -406,10 +409,24 @@ static void machine_code(char *out, size_t outsz)
     unsigned char h[32];
     static const char A32[] = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"; /* 无 0/O/1/I */
     sha256_ctx c;
-    size_t i;
+    size_t i, n;
 
     if (device_seed(seed, sizeof seed) != 0 || !seed[0])
         snprintf(seed, sizeof seed, "unstable-%ld", (long)time(NULL));
+
+    /*
+     * 序列号恰好 16 位时直接当机器码用，不再哈希。
+     * 这样用户在 WebUI 看到的码就是设备序列号本身，能直接和系统设置里的
+     * 序列号对上，不用再去理解一层派生关系。HMAC 的 machine 字段也正是
+     * 16 字节，长度天然吻合。
+     * 非 16 位（其它机型序列号长度不一）仍走哈希，保证唯一且定长。
+     */
+    n = strlen(seed);
+    if (n == 16 && outsz > 16) {
+        memcpy(out, seed, 16);
+        out[16] = 0;
+        return;
+    }
 
     snprintf(buf, sizeof buf, "plq110-suite|%s", seed);
     sha256_init(&c);
@@ -511,6 +528,79 @@ format_error:
     return -3;
 }
 
+/*
+ * PLQ3：Ed25519 非对称签名卡密，99 字符。
+ *   PLQ3-<base64url(payload[6] | sig[64])>
+ *   payload = issued_days:u16be | expires_days:u16be | serial:u16be
+ *   msg     = "PLQ3\0" | machine[16] | "\0" | payload[6]
+ *
+ * 与 KPM 侧完全一致的构造，两边都用 orlp/ed25519 的 verify 实现，
+ * 且都用 RFC 8032 向量验证过。
+ */
+static int lic_parse_plq3(struct lic *L, const char *text, int verify_sig,
+                          char *err, size_t errsz)
+{
+    char code[128];
+    unsigned char raw[70], msg[28];
+    uint32_t issued_days, expires_days, serial;
+    size_t used = 0;
+
+    for (; *text; text++) {
+        unsigned char ch = (unsigned char)*text;
+        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
+        if (used >= sizeof code - 1) goto format_error;
+        code[used++] = (char)ch;
+    }
+    code[used] = 0;
+
+    if (used != 99 || memcmp(code, "PLQ3-", 5) != 0) goto format_error;
+    if (b64u_decode(code + 5, raw, sizeof raw) != 70) goto format_error;
+
+    machine_code(L->dev, sizeof L->dev);
+    if (strlen(L->dev) != 16) {
+        snprintf(err, errsz, "无法取得本机机器码");
+        return -2;
+    }
+
+    memset(msg, 0, sizeof msg);
+    memcpy(msg, "PLQ3", 4);              /* 含结尾 NUL */
+    memcpy(msg + 5, L->dev, 16);
+    msg[21] = 0;
+    memcpy(msg + 22, raw, 6);
+
+    if (verify_sig) {
+        static const unsigned char pk[32] = {
+            0x0c, 0xb4, 0x25, 0xe5, 0xa1, 0xe8, 0xaf, 0x28,
+            0x5f, 0x27, 0xd1, 0x87, 0xe0, 0x30, 0xac, 0xfa,
+            0x3f, 0xda, 0xfe, 0xdd, 0xd7, 0x22, 0x92, 0x46,
+            0xa1, 0x45, 0x05, 0xf6, 0x1b, 0x7e, 0xbd, 0xeb
+        };
+        if (!ed25519_verify(raw + 6, msg, sizeof msg, pk)) {
+            snprintf(err, errsz, "许可证签名无效或与本机不匹配");
+            return -3;
+        }
+    }
+
+    issued_days = ((uint32_t)raw[0] << 8) | (uint32_t)raw[1];
+    expires_days = ((uint32_t)raw[2] << 8) | (uint32_t)raw[3];
+    serial = ((uint32_t)raw[4] << 8) | (uint32_t)raw[5];
+
+    if (!issued_days) goto format_error;
+    if (expires_days && expires_days < issued_days) goto format_error;
+
+    L->ver = 3;
+    L->iat = (long)issued_days * 86400 + 1577836800L;   /* 2020-01-01 起算 */
+    L->exp = expires_days ? ((long)expires_days * 86400 + 1577836800L) : 0;
+    snprintf(L->uid, sizeof L->uid, "%08X", (unsigned int)serial);
+    snprintf(L->payload, sizeof L->payload, "v=3&dev=%s&iat=%ld&exp=%ld&uid=%s",
+             L->dev, L->iat, L->exp, L->uid);
+    return 0;
+
+format_error:
+    snprintf(err, errsz, "短卡密格式错误（应为 PLQ3- 开头的 99 字符单行卡密）");
+    return -3;
+}
+
 static int lic_parse(struct lic *L, const char *text, int verify_sig, char *err, size_t errsz)
 {
     char l1[1024], l2[256];
@@ -521,6 +611,7 @@ static int lic_parse(struct lic *L, const char *text, int verify_sig, char *err,
 
     memset(L, 0, sizeof *L);
     while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') text++;
+    if (strncmp(text, "PLQ3-", 5) == 0) return lic_parse_plq3(L, text, verify_sig, err, errsz);
     if (strncmp(text, "PLQ2-", 5) == 0) return lic_parse_short(L, text, verify_sig, err, errsz);
     l1[0] = l2[0] = 0;
     p = text;

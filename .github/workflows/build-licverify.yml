@@ -1,4 +1,4 @@
-﻿name: build-licverify
+name: build-licverify
 
 # 编译 licverify（授权校验器）。纯 libc 依赖，静态链接，aarch64。
 # 与 build-ki-kpm 一样走交叉编译，产物用于替换模块内的 licverify。
@@ -29,8 +29,9 @@ jobs:
           set -euo pipefail
           SRC="${{ inputs.src }}"
           test -f "$SRC" || { echo "::error::缺源码 $SRC"; exit 1; }
-          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -static \
-            -o licverify "$SRC" 2>&1 | tee /tmp/build.log
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -static -I. \
+            -o licverify "$SRC" \
+            ed25519/verify.c ed25519/fe.c ed25519/ge.c ed25519/sc.c ed25519/sha512.c 2>&1 | tee /tmp/build.log
           ls -l licverify
           file licverify
 
