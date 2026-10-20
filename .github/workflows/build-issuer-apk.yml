@@ -1,0 +1,34 @@
+﻿name: build-issuer-apk
+
+# 用 Android SDK 自带的 aapt2/d8/apksigner 手工打包，不引入 gradle。
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 环境检查
+        run: |
+          set -euo pipefail
+          echo "ANDROID_HOME=${ANDROID_HOME:-<unset>}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-<unset>}"
+          ls -d /usr/local/lib/android/sdk/build-tools/* 2>/dev/null | tail -3 || true
+          java -version 2>&1 | head -1
+
+      - name: 打包
+        working-directory: ki/src/issuer-app
+        run: |
+          set -euo pipefail
+          chmod +x build.sh
+          ./build.sh
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: issuer-apk
+          path: ki/src/issuer-app/issuer.apk
+          if-no-files-found: error
