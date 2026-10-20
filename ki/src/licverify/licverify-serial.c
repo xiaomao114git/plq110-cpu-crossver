@@ -406,10 +406,24 @@ static void machine_code(char *out, size_t outsz)
     unsigned char h[32];
     static const char A32[] = "23456789ABCDEFGHJKLMNPQRSTUVWXYZ"; /* 无 0/O/1/I */
     sha256_ctx c;
-    size_t i;
+    size_t i, n;
 
     if (device_seed(seed, sizeof seed) != 0 || !seed[0])
         snprintf(seed, sizeof seed, "unstable-%ld", (long)time(NULL));
+
+    /*
+     * 序列号恰好 16 位时直接当机器码用，不再哈希。
+     * 这样用户在 WebUI 看到的码就是设备序列号本身，能直接和系统设置里的
+     * 序列号对上，不用再去理解一层派生关系。HMAC 的 machine 字段也正是
+     * 16 字节，长度天然吻合。
+     * 非 16 位（其它机型序列号长度不一）仍走哈希，保证唯一且定长。
+     */
+    n = strlen(seed);
+    if (n == 16 && outsz > 16) {
+        memcpy(out, seed, 16);
+        out[16] = 0;
+        return;
+    }
 
     snprintf(buf, sizeof buf, "plq110-suite|%s", seed);
     sha256_init(&c);
