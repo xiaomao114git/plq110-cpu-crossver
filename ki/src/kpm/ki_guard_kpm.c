@@ -101,6 +101,12 @@ static int ki_enabled = 1;
  * 拦截层时不该崩设备。
  */
 static int ki_hook_full = 0;
+/*
+ * 逐个 hook 开关，默认都开。CFI + BTI 内核上某些 hook 点可能在特定调用路径
+ * 里触发校验失败，需要能单独关掉做二分定位。
+ */
+static int ki_want_open = 1;
+static int ki_want_lookup = 1;
 
 /* ---------------- 参数解析 ---------------- */
 
@@ -557,6 +563,17 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	if (args && ki_take_value(args, "suppress", &val, &len))
 		ki_parse_supps(val, len);
 
+	ki_want_open = 1;
+	ki_want_lookup = 1;
+	if (args && ki_take_value(args, "open", &val, &len)) {
+		if (len >= 1 && val[0] == '0')
+			ki_want_open = 0;
+	}
+	if (args && ki_take_value(args, "lookup", &val, &len)) {
+		if (len >= 1 && val[0] == '0')
+			ki_want_lookup = 0;
+	}
+
 	ki_hook_full = 0;
 	if (args && ki_take_value(args, "hooks", &val, &len)) {
 		if (len >= 4 && val[0] == 'f' && val[1] == 'u' &&
@@ -569,30 +586,38 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	if (ki_nuids <= 0)
 		KI_LOG("drmn: 没有目标 uid，模块不会做任何事\n");
 
-	/* hook do_filp_open：拦 open 族 */
-	addr = kallsyms_lookup_name("do_filp_open");
-	if (!addr)
-		addr = kallsyms_lookup_name("path_openat");
-	KI_LOG("drmn: do_filp_open=%llx\n", (unsigned long long)addr);
-	if (addr) {
-		herr = hook_wrap((void *)addr, 3,
-				 (void *)ki_open_before, (void *)0, (void *)0);
-		KI_LOG("drmn: do_filp_open hook rc=%d\n", (int)herr);
-		if (herr == HOOK_NO_ERR)
-			ki_hooked_open = 1;
+	/* hook do_filp_open：拦 open 族（open=0 可单独关掉，用于二分定位） */
+	if (ki_want_open) {
+		addr = kallsyms_lookup_name("do_filp_open");
+		if (!addr)
+			addr = kallsyms_lookup_name("path_openat");
+		KI_LOG("drmn: do_filp_open=%llx\n", (unsigned long long)addr);
+		if (addr) {
+			herr = hook_wrap((void *)addr, 3,
+					 (void *)ki_open_before, (void *)0, (void *)0);
+			KI_LOG("drmn: do_filp_open hook rc=%d\n", (int)herr);
+			if (herr == HOOK_NO_ERR)
+				ki_hooked_open = 1;
+		}
+	} else {
+		KI_LOG("drmn: open=0，跳过 do_filp_open\n");
 	}
 
-	/* hook filename_lookup：拦 stat/access 族 */
-	addr = kallsyms_lookup_name("filename_lookup");
-	if (!addr)
-		addr = kallsyms_lookup_name("path_lookupat");
-	KI_LOG("drmn: filename_lookup=%llx\n", (unsigned long long)addr);
-	if (addr) {
-		herr = hook_wrap((void *)addr, 5,
-				 (void *)ki_lookup_before, (void *)0, (void *)0);
-		KI_LOG("drmn: filename_lookup hook rc=%d\n", (int)herr);
-		if (herr == HOOK_NO_ERR)
-			ki_hooked_lookup = 1;
+	/* hook filename_lookup：拦 stat/access 族（lookup=0 可单独关掉） */
+	if (ki_want_lookup) {
+		addr = kallsyms_lookup_name("filename_lookup");
+		if (!addr)
+			addr = kallsyms_lookup_name("path_lookupat");
+		KI_LOG("drmn: filename_lookup=%llx\n", (unsigned long long)addr);
+		if (addr) {
+			herr = hook_wrap((void *)addr, 5,
+					 (void *)ki_lookup_before, (void *)0, (void *)0);
+			KI_LOG("drmn: filename_lookup hook rc=%d\n", (int)herr);
+			if (herr == HOOK_NO_ERR)
+				ki_hooked_lookup = 1;
+		}
+	} else {
+		KI_LOG("drmn: lookup=0，跳过 filename_lookup\n");
 	}
 
 	if (ki_hook_full) {
