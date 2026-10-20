@@ -189,7 +189,9 @@ public class MainActivity extends Activity {
         sv.setBackgroundColor(BG);
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
-        root.setPadding(dp(16), dp(20), dp(16), dp(28));
+        // 顶部留出状态栏高度：主题是 NoActionBar 且没做 WindowInsets 处理，
+        // 不留这段 padding 标题会被状态栏压住。
+        root.setPadding(dp(16), dp(38), dp(16), dp(28));
         sv.addView(root);
 
         TextView h = new TextView(this);
