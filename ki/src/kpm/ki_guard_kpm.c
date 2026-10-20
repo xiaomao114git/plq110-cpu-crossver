@@ -92,6 +92,15 @@ static uint64_t ki_mutates;   /* mkdir/unlink/rename 等写操作命中数 */
 static uint64_t ki_readlinks; /* readlink 命中数 */
 
 static int ki_enabled = 1;
+/*
+ * hook 覆盖模式。
+ *   0 = core（默认）：只挂 do_filp_open + filename_lookup，实测 load/unload 稳定
+ *   1 = full：额外挂 mkdir/unlink/rmdir/rename/symlink/readlink 六个入口，
+ *             写操作覆盖更全，但实测 unload 时会触发内核重启
+ * 由加载参数 hooks=full 打开。默认 core 是因为稳定性优先——用户点开关关闭
+ * 拦截层时不该崩设备。
+ */
+static int ki_hook_full = 0;
 
 /* ---------------- 参数解析 ---------------- */
 
@@ -490,6 +499,8 @@ static int ki_fill_status(char *out, int outlen)
 	KI_PUTU(ki_mutates);
 	KI_PUTS(" rl_hit=");
 	KI_PUTU(ki_readlinks);
+	KI_PUTS(" full=");
+	KI_PUTU(ki_hook_full);
 	out[n] = '\0';
 
 #undef KI_PUTU
@@ -546,6 +557,13 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	if (args && ki_take_value(args, "suppress", &val, &len))
 		ki_parse_supps(val, len);
 
+	ki_hook_full = 0;
+	if (args && ki_take_value(args, "hooks", &val, &len)) {
+		if (len >= 4 && val[0] == 'f' && val[1] == 'u' &&
+		    val[2] == 'l' && val[3] == 'l')
+			ki_hook_full = 1;
+	}
+
 	KI_LOG("drmn: uids=%d dirs=%d supp=%d\n", ki_nuids, ki_ndirs_want, ki_nsupp_want);
 
 	if (ki_nuids <= 0)
@@ -577,6 +595,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 			ki_hooked_lookup = 1;
 	}
 
+	if (ki_hook_full) {
 	/*
 	 * 写操作：mkdir / unlink / rmdir 是三个独立入口，必须各自 hook。
 	 * 之前写成 kallsyms_lookup_name("do_mkdirat") 失败才去找 unlinkat、
@@ -647,6 +666,9 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 			ki_hooked_readlink = 1;
 	} else {
 		KI_LOG("drmn: vfs_readlink/dentry_path_raw 缺失，readlink 不拦\n");
+	}
+	} else {
+		KI_LOG("drmn: hooks=core，只挂 2 个主 hook\n");
 	}
 
 	if (!ki_hooked_open && !ki_hooked_lookup) {
