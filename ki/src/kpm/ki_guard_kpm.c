@@ -582,22 +582,32 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	 * 之前写成 kallsyms_lookup_name("do_mkdirat") 失败才去找 unlinkat、
 	 * 再失败才找 rmdir —— 那是"三选一"，do_mkdirat 一存在就再也不 hook
 	 * unlinkat，结果 rm 能穿过（实测 mut_hit 只在 mkdir 时增长）。
+	 *
+	 * argno 必须逐个对上：do_mkdirat 是 3 个参数，但 do_unlinkat 和
+	 * do_rmdir 只有 2 个。统一按 3 传会让 KernelPatch 去保存不存在的
+	 * 第 3 个参数、读到栈上垃圾 —— 实测这就是加载后随即崩溃的原因。
 	 */
 	{
-		static const char *const _muts[] = {
-			"do_mkdirat", "do_unlinkat", "do_rmdir"
+		static const struct {
+			const char *name;
+			int argno;
+		} _muts[] = {
+			{ "do_mkdirat",  3 },
+			{ "do_unlinkat", 2 },
+			{ "do_rmdir",    2 },
 		};
 		int _mi;
 
 		for (_mi = 0; _mi < 3; _mi++) {
-			addr = kallsyms_lookup_name(_muts[_mi]);
+			addr = kallsyms_lookup_name(_muts[_mi].name);
 			if (!addr) {
-				KI_LOG("drmn: %s 不存在，跳过\n", _muts[_mi]);
+				KI_LOG("drmn: %s 不存在，跳过\n", _muts[_mi].name);
 				continue;
 			}
-			herr = hook_wrap((void *)addr, 3,
+			herr = hook_wrap((void *)addr, _muts[_mi].argno,
 					 (void *)ki_mutate_before, (void *)0, (void *)0);
-			KI_LOG("drmn: %s hook rc=%d\n", _muts[_mi], (int)herr);
+			KI_LOG("drmn: %s hook rc=%d (argno=%d)\n",
+			       _muts[_mi].name, (int)herr, _muts[_mi].argno);
 			if (herr == HOOK_NO_ERR)
 				ki_hooked_mutate++;
 		}
