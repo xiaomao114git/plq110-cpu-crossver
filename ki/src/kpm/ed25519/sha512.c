@@ -168,10 +168,10 @@ int sha512_init(sha512_context * md) {
    @param inlen  The length of the data (octets)
    @return 0 if successful
 */
-int sha512_update (sha512_context * md, const unsigned char *in, size_t inlen)               
+int sha512_update (sha512_context * md, const unsigned char *in, unsigned long inlen)               
 {                                                                                           
-    size_t n;
-    size_t i;                                                                        
+    unsigned long n;
+    unsigned long i;                                                                        
     int           err;     
     if (md == NULL) return 1;  
     if (in == NULL) return 1;                                                              
@@ -264,7 +264,7 @@ for (i = 0; i < 8; i++) {
 return 0;
 }
 
-int sha512(const unsigned char *message, size_t message_len, unsigned char *out)
+int sha512(const unsigned char *message, unsigned long message_len, unsigned char *out)
 {
     sha512_context ctx;
     int ret;
