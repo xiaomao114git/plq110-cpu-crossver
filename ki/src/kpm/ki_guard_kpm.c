@@ -876,7 +876,10 @@ static int ki_b64u_decode(const char *in, int inlen, uint8_t *out, int outmax)
  */
 static int ki_verify_license(const char *lic, int liclen, const char *mid)
 {
-	uint8_t raw[70], msg[25];
+	/* msg 长度必须是 4+1+16+1+6 = 28 字节。
+	 * 早先写成 25 是算错的——payload 写到 msg[22..27] 就越界了，
+	 * sizeof(msg) 又传 25，签名永远对不上，表现为「正确卡密也被拒绝」。 */
+	uint8_t raw[70], msg[28];
 	uint32_t issued_days, expires_days;
 	int i, n;
 
