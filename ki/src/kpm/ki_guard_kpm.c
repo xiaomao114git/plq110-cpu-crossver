@@ -797,6 +797,196 @@ static void ki_sha256_final(struct ki_sha256_ctx *c, uint8_t out[32])
  * 签名输入：salt | uids 原文 | dirs 原文 | argno
  * 刻意用分隔符 '|'，避免 uid 串和目录串拼接后产生歧义。
  */
+/* ---------------- 许可证验证 ---------------- */
+
+/*
+ * 为什么 KPM 要自己验许可证：
+ *   原来只验「参数签名」，而 salt 存在 config.sec 里，解出来就能给任意设备
+ *   重算签名；更糟的是不传 sig 直接走「兼容模式」，别人拷走 .kpm 一句
+ *   kpatch kpm load 就能用。要让「搬走即用」失效，验证必须发生在内核里，
+ *   而且依据必须绑死设备。
+ *
+ * 依据是 licverify 签发的 PLQ2 许可证：
+ *   PLQ2-<base64url(issued:4 | expires:4 | serial:4 | tag:16)>
+ *   tag = HMAC-SHA256(key, "PLQ2\0" | machine[16] | "\0" | fields[12])[:16]
+ *
+ * 关键点：machine 是 HMAC 的*输入*，不在许可证里。所以 KPM 用脚本传来的
+ * mid 重算 tag——mid 必须是这台设备的真机器码，否则算不出原 tag。
+ *   - 拷走 KPM + 模块：他设备的 mid 不同 → tag 不符 → 拒绝
+ *   - 拷走你的 license.txt：同上，一样拒绝
+ *   - 自己发卡：得先逆向出 KPM 里的 key（提高成本，不是绝对防住）
+ */
+
+/* 与 licverify 的 lic_key() 完全一致：两半各与垃圾字节异或后拼成 32 字节 */
+static const uint8_t ki_k1[16] = {
+	0x5a, 0x17, 0xc4, 0x91, 0x3e, 0x6d, 0x08, 0xf2,
+	0xb3, 0x4a, 0x77, 0xd9, 0x26, 0x8e, 0x51, 0x0b
+};
+static const uint8_t ki_kj[8] = {
+	0xaa, 0x55, 0xaa, 0x55, 0x13, 0x37, 0xde, 0xad
+};
+static const uint8_t ki_k2[16] = {
+	0x9c, 0xe0, 0x35, 0x72, 0x4f, 0x1b, 0xa6, 0xd8,
+	0x63, 0x2c, 0x80, 0xf5, 0x09, 0xb7, 0x4e, 0x21
+};
+
+static void ki_lic_key(uint8_t out[32])
+{
+	int i;
+
+	for (i = 0; i < 16; i++)
+		out[i] = (uint8_t)(ki_k1[i] ^ ki_kj[i % 8]);
+	for (i = 0; i < 16; i++)
+		out[16 + i] = (uint8_t)(ki_k2[i] ^ ki_kj[(i + 3) % 8]);
+}
+
+static void ki_hmac_sha256(const uint8_t *key, uint32_t klen,
+			   const uint8_t *msg, uint32_t mlen, uint8_t out[32])
+{
+	struct ki_sha256_ctx c;
+	uint8_t k[64], ip[64], op[64], inner[32];
+	uint32_t i;
+
+	for (i = 0; i < 64; i++)
+		k[i] = 0;
+	if (klen > 64) {
+		ki_sha256_init(&c);
+		ki_sha256_update(&c, key, klen);
+		ki_sha256_final(&c, k);
+	} else {
+		for (i = 0; i < klen; i++)
+			k[i] = key[i];
+	}
+	for (i = 0; i < 64; i++) {
+		ip[i] = (uint8_t)(k[i] ^ 0x36);
+		op[i] = (uint8_t)(k[i] ^ 0x5c);
+	}
+
+	ki_sha256_init(&c);
+	ki_sha256_update(&c, ip, 64);
+	ki_sha256_update(&c, msg, mlen);
+	ki_sha256_final(&c, inner);
+
+	ki_sha256_init(&c);
+	ki_sha256_update(&c, op, 64);
+	ki_sha256_update(&c, inner, 32);
+	ki_sha256_final(&c, out);
+}
+
+static int ki_b64u_val(char ch)
+{
+	if (ch >= 'A' && ch <= 'Z')
+		return ch - 'A';
+	if (ch >= 'a' && ch <= 'z')
+		return ch - 'a' + 26;
+	if (ch >= '0' && ch <= '9')
+		return ch - '0' + 52;
+	if (ch == '-')
+		return 62;
+	if (ch == '_')
+		return 63;
+	return -1;
+}
+
+/* base64url 无填充解码；返回写出字节数，-1 表示非法字符 */
+static int ki_b64u_decode(const char *in, int inlen, uint8_t *out, int outmax)
+{
+	int i, o = 0;
+	uint32_t acc = 0;
+	int bits = 0;
+
+	for (i = 0; i < inlen; i++) {
+		int v = ki_b64u_val(in[i]);
+
+		if (v < 0)
+			return -1;
+		acc = (acc << 6) | (uint32_t)v;
+		bits += 6;
+		if (bits >= 8) {
+			bits -= 8;
+			if (o >= outmax)
+				return -1;
+			out[o++] = (uint8_t)((acc >> bits) & 0xff);
+		}
+	}
+	return o;
+}
+
+/*
+ * 验证 PLQ2 许可证。
+ *   lic / liclen : "PLQ2-<38 字符>"，长度 43
+ *   mid          : 本机机器码，恰好 16 字符
+ * 返回 1 通过，0 拒绝。
+ */
+static int ki_verify_license(const char *lic, int liclen, const char *mid)
+{
+	uint8_t raw[28], key[32], mac[32], msg[34];
+	uint32_t issued, expires;
+	int i, n;
+
+	if (!lic || !mid)
+		return 0;
+	if (liclen != 43)
+		return 0;
+	if (ki_strlen(mid) != 16)
+		return 0;
+	if (lic[0] != 'P' || lic[1] != 'L' || lic[2] != 'Q' ||
+	    lic[3] != '2' || lic[4] != '-')
+		return 0;
+
+	n = ki_b64u_decode(lic + 5, liclen - 5, raw, (int)sizeof(raw));
+	if (n != 28)
+		return 0;
+
+	/* msg = "PLQ2" + NUL + machine[16] + NUL + fields[12] */
+	msg[0] = 'P'; msg[1] = 'L'; msg[2] = 'Q'; msg[3] = '2'; msg[4] = 0;
+	for (i = 0; i < 16; i++)
+		msg[5 + i] = (uint8_t)mid[i];
+	msg[21] = 0;
+	for (i = 0; i < 12; i++)
+		msg[22 + i] = raw[i];
+
+	ki_lic_key(key);
+	ki_hmac_sha256(key, 32, msg, sizeof(msg), mac);
+
+	{
+		uint8_t diff = 0;
+
+		for (i = 0; i < 16; i++)
+			diff |= (uint8_t)(raw[12 + i] ^ mac[i]);
+		if (diff)
+			return 0;
+	}
+
+	issued = ((uint32_t)raw[0] << 24) | ((uint32_t)raw[1] << 16) |
+		 ((uint32_t)raw[2] << 8) | (uint32_t)raw[3];
+	expires = ((uint32_t)raw[4] << 24) | ((uint32_t)raw[5] << 16) |
+		  ((uint32_t)raw[6] << 8) | (uint32_t)raw[7];
+
+	if (!issued)
+		return 0;
+	if (expires && expires < issued)
+		return 0;
+
+	return 1;
+}
+
+/* 把 uids 串里的每个数字加起来：参数签名之外再加一道，
+ * 让「改了 uids 但用旧 sig」在许可证层也过不去（sig 已含 uids，这里是冗余保险）。 */
+static uint64_t ki_uids_fingerprint(const char *uids)
+{
+	uint64_t h = 1469598103934665603ULL;
+	const char *p = uids;
+
+	if (!p)
+		return h;
+	while (*p) {
+		h ^= (uint8_t)*p++;
+		h *= 1099511628211ULL;
+	}
+	return h;
+}
+
 static void ki_sign(const char *salt, const char *uids, const char *dirs,
 		    const char *argno, uint8_t out[32])
 {
@@ -953,8 +1143,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	 * 参数签名校验。
 	 *
 	 * 语义：
-	 *   sig 未提供   -> 兼容模式，跳过校验（便于先验证加载与功能）
-	 *   sig 提供了   -> 必须匹配，否则直接返回错误、一个 hook 都不挂
+	 *   sig 必须提供且匹配，否则直接返回错误、一个 hook 都不挂。
 	 *
 	 * 校验失败时不"部分工作"，因为部分生效比完全不生效更危险：
 	 * 用户会以为拦截在跑，实际却漏了目标应用。
@@ -1015,7 +1204,55 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 			}
 			KI_LOG("drmn: 参数签名校验通过\n");
 		} else {
-			KI_LOG("drmn: 未提供签名（兼容模式，跳过校验）\n");
+			KI_ERR("drmn: 缺少参数签名，拒绝加载\n");
+			ki_enabled = 0;
+			return -EACCES;
+		}
+	}
+
+	/*
+	 * 许可证校验：必须提供 lic= 与 mid=，且 tag 与本机机器码匹配。
+	 *
+	 * 这一层是防「拷走即用」的关键。之前的「兼容模式」（不传 sig 就跳过）
+	 * 等于没有验证——别人拷走 .kpm 直接 kpatch kpm load 就能用。
+	 * 现在缺 lic 或缺 mid 一律拒绝，不再有跳过分支。
+	 */
+	{
+		const char *v_lic = 0, *v_mid = 0;
+		int l_lic = 0, l_mid = 0;
+
+		if (args) {
+			ki_take_value(args, "lic", &v_lic, &l_lic);
+			ki_take_value(args, "mid", &v_mid, &l_mid);
+		}
+		(void)l_mid;
+
+		if (!v_lic || l_lic <= 0 || !v_mid) {
+			KI_ERR("drmn: 缺少许可证或机器码，拒绝加载\n");
+			ki_enabled = 0;
+			return -EACCES;
+		}
+
+		{
+			char b_lic[64], b_mid[24];
+			int i;
+
+			b_lic[0] = 0; b_mid[0] = 0;
+			for (i = 0; i < l_lic && i < 63 && v_lic[i] &&
+				    v_lic[i] != ' ' && v_lic[i] != '\t'; i++)
+				b_lic[i] = v_lic[i];
+			b_lic[i] = 0;
+			for (i = 0; i < 23 && v_mid[i] &&
+				    v_mid[i] != ' ' && v_mid[i] != '\t'; i++)
+				b_mid[i] = v_mid[i];
+			b_mid[i] = 0;
+
+			if (!ki_verify_license(b_lic, ki_strlen(b_lic), b_mid)) {
+				KI_ERR("drmn: 许可证无效或与本机不匹配，拒绝加载\n");
+				ki_enabled = 0;
+				return -EACCES;
+			}
+			KI_LOG("drmn: 许可证校验通过（mid=%s）\n", b_mid);
 		}
 	}
 
