@@ -62,13 +62,35 @@ KPM_DESCRIPTION("机型/指纹/CPU 伪装 + 目录隐藏");
 /*
  * 输出开关：默认 0 —— 加载、挂 hook、卸载全程不写 dmesg。
  * insmod 都已经会留 taint，别再额外留文字痕迹。
+ *
+ * KI_RELEASE（发布构建）会把所有 KI_LOG/KI_ERR 的格式串整体编译掉。
+ * 原因是那些串写着方案细节：「缺少参数签名，拒绝加载」「许可证无效或与本机
+ * 不匹配」「[lic] liclen=%d 应为 99」—— 任何拿到 .kpm 的人 strings 一下
+ * 就得到了整套授权设计。发布版不再留这些文字，改用数字错误码：
+ *
+ *     kpatch kpm ctl0 <名字> status  →  ... err=<数字>
+ *
+ * 数字含义见文件末尾 ki_fail() 的调用点；对买家只报数字，出问题你按码查。
  */
 static int ki_verbose = 0;
 
+/* 最近一次失败原因（数字码），通过 ctl0 的 err= 字段读回 */
+static int ki_err_code;
+
+static void ki_fail(int code)
+{
+	ki_err_code = code;
+}
+
+#ifdef KI_RELEASE
+#define KI_LOG(...) do { } while (0)
+#define KI_ERR(...) do { } while (0)
+#else
 #define KI_LOG(...) \
 	do { if (ki_verbose) pr_info(__VA_ARGS__); } while (0)
 #define KI_ERR(...) \
 	do { if (ki_verbose) pr_err(__VA_ARGS__); } while (0)
+#endif
 
 #define KI_MAX_UIDS 32
 #define KI_MAX_DIRS 8
@@ -419,10 +441,64 @@ static void ki_readlink_before(hook_fargs3_t *fargs, void *udata)
 	ki_readlinks++;
 }
 
-/* ---------------- /proc/cpuinfo 伪装 ---------------- */
+/* ---------------- 加密数据与解密 ---------------- */
 
-/* cpuinfo 文本编译进 .rodata（命令行传不下 3~7 KB）。自动生成。 */
-#include "ki_cpuinfo_gen.h"
+/*
+ * 加密表（cpuinfo 文本 + 内核符号名）由 tools/gen_kpm_obf.py 生成。
+ * 明文不在二进制里，运行时解到静态缓冲区再用。
+ *
+ * 为什么只加密数据、不加密 .text：
+ *   KPM 是 ELF ET_REL，KernelPatch 的加载器必须读 ELF 头、搬 .text、
+ *   解析 .rela.text 里的未定义符号并应用重定位。这些都要求明文。
+ *   真要加密代码，解密 stub 也得先能执行，而那时重定位还没应用 —— 死结。
+ *   所以能加固的只有数据：把「strings 一下就看懂」变成「必须先逆向」。
+ */
+#include "ki_obf_gen.h"
+
+/* 解密缓冲区。cpuinfo 最大 6827 B，符号名最长 20 B（含 NUL）。 */
+static char ki_cpu_buf[KI_CPU_MAX_LEN + 1];
+static char ki_sym_buf[KI_SYM_MAX_LEN + 1];
+
+/* XOR 解密到 out，返回长度；out 会被 NUL 截断 */
+static int ki_obf_dec(const uint8_t *enc, int len, int off, char *out, int outsz)
+{
+	int i;
+
+	if (len <= 0 || len >= outsz)
+		return 0;
+	for (i = 0; i < len; i++)
+		out[i] = (char)(enc[i] ^ ki_obf_key[(i + off) & 31]);
+	out[len] = 0;
+	return len;
+}
+
+/* 取第 idx 个内核符号名（解密到共享缓冲，只在 ki_init 里用，无并发） */
+static const char *ki_sym(int idx)
+{
+	if (idx < 0 || idx >= KI_SYM_COUNT)
+		return 0;
+	ki_obf_dec(ki_obf_sym_tab[idx].enc, ki_obf_sym_tab[idx].len,
+		   ki_obf_sym_tab[idx].off, ki_sym_buf, (int)sizeof(ki_sym_buf));
+	return ki_sym_buf;
+}
+
+/* 解密 cpuinfo 档位文本；失败返回 0 */
+static const char *ki_cpu_text(int prof)
+{
+	int len;
+
+	if (prof == KI_CPU_PROF_8T)
+		len = KI_CPU_LEN_0;
+	else if (prof == KI_CPU_PROF_16T)
+		len = KI_CPU_LEN_1;
+	else
+		return 0;
+	ki_obf_dec(ki_obf_cpu_tab[prof].enc, len, ki_obf_cpu_tab[prof].off,
+		   ki_cpu_buf, (int)sizeof(ki_cpu_buf));
+	return ki_cpu_buf;
+}
+
+/* ---------------- /proc/cpuinfo 伪装 ---------------- */
 
 /*
  * 从 cpuinfo_spoof.ko 搬过来。原模块用 kprobe 在 seq_open 前置 hook，
@@ -676,6 +752,9 @@ static int ki_fill_status(char *out, int outlen)
 	KI_PUTU(ki_cpu_scanned);
 	KI_PUTS(" full=");
 	KI_PUTU(ki_hook_full);
+	/* 发布版没有日志，失败原因靠这个数字码读回（0 = 无错误） */
+	KI_PUTS(" err=");
+	KI_PUTU((uint64_t)(long)ki_err_code);
 	out[n] = '\0';
 
 #undef KI_PUTU
@@ -1040,6 +1119,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	ki_nsupp_want = 0;
 	ki_nsupp_hooked = 0;
 	ki_nwraps = 0;
+	ki_err_code = 0;
 	ki_hits = 0;
 	ki_lookups = 0;
 	ki_mutates = 0;
@@ -1083,19 +1163,18 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	}
 
 	/*
-	 * CPU 伪装档位：cpu=8t / cpu=16t / cpu=0（默认关）。
-	 * 文本编译进 .rodata，这里只选指针。默认关是为了向后兼容——
-	 * 老调用方式不传 cpu 就完全不受影响。
+	 * CPU 伪装档位：cpu=8t / cpu=16t / 不传=关。
+	 * 文本在 .rodata 里是加密的，这里解到 ki_cpu_buf 再交给 seq_puts。
 	 */
 	ki_cpu_enabled = 0;
 	ki_cpuinfo_text = 0;
 	if (args && ki_take_value(args, "cpu", &val, &len) && len >= 2) {
 		if (val[0] == '8' && val[1] == 't') {
-			ki_cpuinfo_text = ki_cpuinfo_8t;
-			ki_cpu_enabled = 1;
+			ki_cpuinfo_text = ki_cpu_text(KI_CPU_PROF_8T);
+			ki_cpu_enabled = ki_cpuinfo_text ? 1 : 0;
 		} else if (val[0] == '1' && val[1] == '6') {
-			ki_cpuinfo_text = ki_cpuinfo_16t;
-			ki_cpu_enabled = 1;
+			ki_cpuinfo_text = ki_cpu_text(KI_CPU_PROF_16T);
+			ki_cpu_enabled = ki_cpuinfo_text ? 1 : 0;
 		}
 	}
 
@@ -1160,13 +1239,13 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 			}
 
 			if (!ki_verify_sig(b_salt, b_uids, b_dirs, b_argno, v_sig, l_sig)) {
-				KI_ERR("drmn: 参数签名不匹配，拒绝加载\n");
+				KI_ERR("drmn: 参数签名不匹配，拒绝加载\n"); ki_fail(12);
 				ki_enabled = 0;
 				return -EACCES;
 			}
 			KI_LOG("drmn: 参数签名校验通过\n");
 		} else {
-			KI_ERR("drmn: 缺少参数签名，拒绝加载\n");
+			KI_ERR("drmn: 缺少参数签名，拒绝加载\n"); ki_fail(11);
 			ki_enabled = 0;
 			return -EACCES;
 		}
@@ -1190,7 +1269,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 		(void)l_mid;
 
 		if (!v_lic || l_lic <= 0 || !v_mid) {
-			KI_ERR("drmn: 缺少许可证或机器码，拒绝加载\n");
+			KI_ERR("drmn: 缺少许可证或机器码，拒绝加载\n"); ki_fail(21);
 			ki_enabled = 0;
 			return -EACCES;
 		}
@@ -1213,7 +1292,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 			b_mid[i] = 0;
 
 			if (!ki_verify_license(b_lic, ki_strlen(b_lic), b_mid)) {
-				KI_ERR("drmn: 许可证无效或与本机不匹配，拒绝加载\n");
+				KI_ERR("drmn: 许可证无效或与本机不匹配，拒绝加载\n"); ki_fail(22);
 				ki_enabled = 0;
 				return -EACCES;
 			}
@@ -1226,7 +1305,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 
 	/* hook do_filp_open：拦 open 族（open=0 可单独关掉，用于二分定位） */
 	if (ki_want_open) {
-		addr = kallsyms_lookup_name("do_filp_open");
+		addr = kallsyms_lookup_name(ki_sym(KI_SYM_FILP_OPEN));
 
 		KI_LOG("drmn: do_filp_open=%llx\n", (unsigned long long)addr);
 		if (addr) {
@@ -1242,7 +1321,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 
 	/* hook filename_lookup：拦 stat/access 族（lookup=0 可单独关掉） */
 	if (ki_want_lookup) {
-		addr = kallsyms_lookup_name("filename_lookup");
+		addr = kallsyms_lookup_name(ki_sym(KI_SYM_LOOKUP));
 
 		KI_LOG("drmn: filename_lookup=%llx\n", (unsigned long long)addr);
 		if (addr) {
@@ -1268,35 +1347,38 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	 * 第 3 个参数、读到栈上垃圾 —— 实测这就是加载后随即崩溃的原因。
 	 */
 	{
+		/* 符号名不再以字面量出现，改用 ki_obf_gen.h 里的加密表索引 */
 		static const struct {
-			const char *name;
+			int idx;
 			int argno;
 		} _muts[] = {
-			{ "do_mkdirat",  3 },
-			{ "do_unlinkat", 2 },
-			{ "do_rmdir",    2 },
+			{ KI_SYM_MKDIRAT,  3 },
+			{ KI_SYM_UNLINKAT, 2 },
+			{ KI_SYM_RMDIR,    2 },
 		};
 		int _mi;
 
 		for (_mi = 0; _mi < 3; _mi++) {
-			addr = kallsyms_lookup_name(_muts[_mi].name);
+			const char *nm = ki_sym(_muts[_mi].idx);
+
+			addr = kallsyms_lookup_name(nm);
 			if (!addr) {
-				KI_LOG("drmn: %s 不存在，跳过\n", _muts[_mi].name);
+				KI_LOG("drmn: mut %d 不存在，跳过\n", _mi);
 				continue;
 			}
 			herr = ki_register_wrap((void *)addr, _muts[_mi].argno,
 					 (void *)ki_mutate_before, (void *)0, (void *)0);
-			KI_LOG("drmn: %s hook rc=%d (argno=%d)\n",
-			       _muts[_mi].name, (int)herr, _muts[_mi].argno);
+			KI_LOG("drmn: mut %d hook rc=%d (argno=%d)\n",
+			       _mi, (int)herr, _muts[_mi].argno);
 			if (herr == HOOK_NO_ERR)
 				ki_hooked_mutate++;
 		}
 	}
 
 	/* 双路径：rename / link —— filename 在 arg1 和 arg3 */
-	addr = kallsyms_lookup_name("do_renameat2");
+	addr = kallsyms_lookup_name(ki_sym(KI_SYM_RENAME));
 	if (!addr)
-		addr = kallsyms_lookup_name("do_linkat");
+		addr = kallsyms_lookup_name(ki_sym(KI_SYM_LINKAT));
 	if (addr) {
 		herr = ki_register_wrap((void *)addr, 5,
 				 (void *)ki_rename_before, (void *)0, (void *)0);
@@ -1306,7 +1388,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	}
 
 	/* do_symlinkat(from, newdfd, to) —— arg0 和 arg2 */
-	addr = kallsyms_lookup_name("do_symlinkat");
+	addr = kallsyms_lookup_name(ki_sym(KI_SYM_SYMLINKAT));
 	if (addr) {
 		herr = ki_register_wrap((void *)addr, 3,
 				 (void *)ki_symlink_before, (void *)0, (void *)0);
@@ -1317,8 +1399,8 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 
 	/* readlink：只有 dentry，用 dentry_path_raw 反查路径 */
 	ki_dentry_path_raw = (char *(*)(void *, char *, int))
-		kallsyms_lookup_name("dentry_path_raw");
-	addr = kallsyms_lookup_name("vfs_readlink");
+		kallsyms_lookup_name(ki_sym(KI_SYM_DENTRY_PATH));
+	addr = kallsyms_lookup_name(ki_sym(KI_SYM_READLINK));
 	if (addr && ki_dentry_path_raw) {
 		herr = ki_register_wrap((void *)addr, 3,
 				 (void *)ki_readlink_before, (void *)0, (void *)0);
@@ -1339,8 +1421,8 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	 */
 	if (ki_cpu_enabled) {
 		ki_seq_puts = (void *(*)(void *, const char *))
-			kallsyms_lookup_name("seq_puts");
-		ki_cpuinfo_op_addr = kallsyms_lookup_name("cpuinfo_op");
+			kallsyms_lookup_name(ki_sym(KI_SYM_SEQ_PUTS));
+		ki_cpuinfo_op_addr = kallsyms_lookup_name(ki_sym(KI_SYM_CPUINFO_OP));
 		ki_cpuinfo_ops.start = (void *(*)(void *, void *))ki_sp_start;
 		ki_cpuinfo_ops.stop = (void (*)(void *, void *))ki_sp_stop;
 		ki_cpuinfo_ops.next = (void *(*)(void *, void *, void *))ki_sp_next;
@@ -1350,13 +1432,13 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 		       (unsigned long long)(uintptr_t)ki_seq_puts,
 		       (unsigned long long)ki_cpuinfo_op_addr);
 		if (!ki_seq_puts) {
-			KI_ERR("drmn: 找不到 seq_puts，CPU 伪装无法输出\n");
+			KI_ERR("drmn: 找不到 seq_puts，CPU 伪装无法输出\n"); ki_fail(41);
 			ki_cpu_enabled = 0;
 		} else if (!ki_cpuinfo_op_addr) {
-			KI_ERR("drmn: 找不到 cpuinfo_op，CPU 伪装无法识别目标\n");
+			KI_ERR("drmn: 找不到 cpuinfo_op，CPU 伪装无法识别目标\n"); ki_fail(42);
 			ki_cpu_enabled = 0;
 		} else {
-			addr = kallsyms_lookup_name("seq_open");
+			addr = kallsyms_lookup_name(ki_sym(KI_SYM_SEQ_OPEN));
 			KI_LOG("drmn: seq_open=%llx\n", (unsigned long long)addr);
 			if (addr) {
 				herr = ki_register_wrap((void *)addr, 2,
@@ -1366,7 +1448,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 					ki_hooked_cpu = 1;
 			}
 			if (!ki_hooked_cpu) {
-				KI_ERR("drmn: seq_open 挂不上，CPU 伪装停用\n");
+				KI_ERR("drmn: seq_open 挂不上，CPU 伪装停用\n"); ki_fail(43);
 				ki_cpu_enabled = 0;
 			}
 		}
@@ -1376,7 +1458,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 		ki_enabled = 0;
 		ki_unregister_wraps();
 		ki_cpu_enabled = 0;
-		KI_ERR("drmn: 两个主 hook 点都挂不上，无法工作\n");
+		KI_ERR("drmn: 两个主 hook 点都挂不上，无法工作\n"); ki_fail(31);
 		return -EIO;
 	}
 

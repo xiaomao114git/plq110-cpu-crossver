@@ -17,9 +17,11 @@ ifdef NDK_PATH
   TOOLCHAIN := $(NDK_PATH)/toolchains/llvm/prebuilt/linux-x86_64/bin/aarch64-linux-android31-
   CC := $(TOOLCHAIN)clang
   STRIP := $(TOOLCHAIN)llvm-strip
+  OBJCOPY := $(TOOLCHAIN)llvm-objcopy
 else
   CC := clang --target=aarch64-linux-gnu
   STRIP ?= llvm-strip
+  OBJCOPY ?= llvm-objcopy
 endif
 
 INCLUDE_DIRS := include patch/include linux/include \
@@ -33,6 +35,13 @@ CFLAGS := $(INCLUDE_FLAGS) -O2 -Wall \
           -fno-unwind-tables -fno-semantic-interposition -U_FORTIFY_SOURCE \
           -fno-common -fvisibility=hidden \
           -mgeneral-regs-only -ffixed-x18 -ffreestanding -fno-builtin
+
+# RELEASE=1（默认）时把 KI_LOG/KI_ERR 的格式串整体编译掉。
+# 那些串写着授权与 hook 的细节，发布版不该带。开发调试用 make RELEASE=0。
+RELEASE ?= 1
+ifeq ($(RELEASE),1)
+  CFLAGS += -DKI_RELEASE
+endif
 
 # Ed25519 验签（来自 orlp/ed25519，无 libc、无 SIMD）。
 # 只编验证路径：verify/sc/fe/ge/sha512。签名用不到，故不含 sign.c/keypair.c。
@@ -55,12 +64,18 @@ all: $(MOD)
 # NDK 的 clang 自带这个默认值，系统 clang 没有。
 #
 # -r 保留重定位，KernelPatch 运行时自己做 relo
+#
+# --localize-hidden 这一步很关键：我们用了 -fvisibility=hidden，但 ld -r 会把
+# 跨编译单元的符号留成 GLOBAL（哪怕它们实际是 HIDDEN 的），于是 ed25519 的
+# fe_mul / ge_frombytes_negate_vartime 这些名字就躺在 .symtab 里，
+# 等于告诉对方「这里用了标准 Ed25519」。先本地化再 strip 就能清掉。
 $(MOD): $(OBJS)
 	$(CC) -fuse-ld=lld -r -o $@ $^
+	$(OBJCOPY) --localize-hidden $@
 	$(STRIP) -g --strip-unneeded --strip-debug \
 		--remove-section=.comment --remove-section=.note.GNU-stack $@
 
-ki_guard_kpm.o: ki_guard_kpm.c ki_guard_kpm.lds ki_cpuinfo_gen.h Makefile
+ki_guard_kpm.o: ki_guard_kpm.c ki_guard_kpm.lds ki_obf_gen.h Makefile
 	$(CC) $(CFLAGS) -T ki_guard_kpm.lds -c -o $@ $<
 
 # ed25519 源文件用同一套 CFLAGS，但不需要链接脚本（-T 只对最终布局有意义）。
