@@ -8,6 +8,14 @@
     #include <stdint.h>
     #define FIXEDINT_H_INCLUDED
 
+    /* KPM 内核态的 stdint.h 只给类型、不给这些便利宏，sha512.c 需要它们 */
+    #ifndef UINT64_C
+        #define UINT64_C(v) v ## ULL
+    #endif
+    #ifndef INT64_C
+        #define INT64_C(v) v ## LL
+    #endif
+
     #if defined(__WATCOMC__) && __WATCOMC__ >= 1250 && !defined(UINT64_C)
         #include <limits.h>
         #define UINT64_C(x) (x + (UINT64_MAX - UINT64_MAX))
