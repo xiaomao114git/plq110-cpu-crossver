@@ -7,8 +7,8 @@ on:
   workflow_dispatch:
     inputs:
       src:
-        description: '源码路径'
-        default: 'ki/src/licverify/licverify-serial.c'
+        description: '源码文件名（相对 ki/src/licverify）'
+        default: 'licverify-serial.c'
 
 jobs:
   build:
@@ -25,6 +25,7 @@ jobs:
           aarch64-linux-gnu-gcc --version | head -1
 
       - name: 编译
+        working-directory: ki/src/licverify
         run: |
           set -euo pipefail
           SRC="${{ inputs.src }}"
@@ -47,6 +48,6 @@ jobs:
         with:
           name: licverify
           path: |
-            licverify
+            ki/src/licverify/licverify
             /tmp/build.log
           if-no-files-found: error
