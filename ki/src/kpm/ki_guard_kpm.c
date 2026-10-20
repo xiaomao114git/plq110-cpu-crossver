@@ -837,15 +837,19 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	 */
 	{
 		const char *v_uids = 0, *v_dirs = 0, *v_salt = 0, *v_sig = 0, *v_argno = 0;
-		int l_uids = 0, l_dirs = 0, l_sig = 0;
+		/* 每个参数必须有独立的长度变量：共用一个会让后取的键覆盖前面的长度，
+		 * 实测就是这么错的——l_uids 被 argno 的 1 覆盖后，uids 只拷到首字符，
+		 * 算出的签名永远对不上。 */
+		int l_uids = 0, l_dirs = 0, l_salt = 0, l_sig = 0, l_argno = 0;
 
 		if (args) {
 			ki_take_value(args, "uids", &v_uids, &l_uids);
 			ki_take_value(args, "dirs", &v_dirs, &l_dirs);
-			ki_take_value(args, "salt", &v_salt, &l_uids);
-			ki_take_value(args, "argno", &v_argno, &l_uids);
+			ki_take_value(args, "salt", &v_salt, &l_salt);
+			ki_take_value(args, "argno", &v_argno, &l_argno);
 			ki_take_value(args, "sig", &v_sig, &l_sig);
 		}
+		(void)l_salt;
 
 		if (v_sig && l_sig > 0) {
 			/* 把 uids/dirs/argno 的原文按长度取出，避免依赖 NUL 结尾 */
