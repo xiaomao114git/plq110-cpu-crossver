@@ -34,7 +34,15 @@ CFLAGS := $(INCLUDE_FLAGS) -O2 -Wall \
           -fno-common -fvisibility=hidden \
           -mgeneral-regs-only -ffixed-x18 -ffreestanding -fno-builtin
 
-OBJS := ki_guard_kpm.o
+# Ed25519 验签（来自 orlp/ed25519，无 libc、无 SIMD）。
+# 只编验证路径：verify/sc/fe/ge/sha512。签名用不到，故不含 sign.c/keypair.c。
+# precomp_data.h 是 ge_scalarmult_base 的预计算表，链接时若无人引用会被丢弃，
+# 但源码保留能让 ge.c 不必裁剪——裁剪过的密码学代码风险太高。
+ED_DIR := ed25519
+ED_SRCS := $(ED_DIR)/verify.c $(ED_DIR)/fe.c $(ED_DIR)/ge.c $(ED_DIR)/sc.c $(ED_DIR)/sha512.c
+ED_OBJS := $(ED_SRCS:.c=.o)
+
+OBJS := ki_guard_kpm.o $(ED_OBJS)
 
 # 产物名刻意不用 ki_guard：这个文件在 /data/adb 下，厂商内核态检测读得到。
 # 名字取成骁龙显示栈里常见的样子，融进背景。
@@ -54,6 +62,11 @@ $(MOD): $(OBJS)
 
 ki_guard_kpm.o: ki_guard_kpm.c ki_guard_kpm.lds ki_cpuinfo_gen.h Makefile
 	$(CC) $(CFLAGS) -T ki_guard_kpm.lds -c -o $@ $<
+
+# ed25519 源文件用同一套 CFLAGS，但不需要链接脚本（-T 只对最终布局有意义）。
+# -I$(ED_DIR) 让内部 "#include \"fe.h\"" 这类相对引用能找到。
+$(ED_DIR)/%.o: $(ED_DIR)/%.c
+	$(CC) $(CFLAGS) -I$(ED_DIR) -c -o $@ $<
 
 clean:
 	rm -f $(OBJS) $(MOD)

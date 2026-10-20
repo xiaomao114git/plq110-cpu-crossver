@@ -797,81 +797,37 @@ static void ki_sha256_final(struct ki_sha256_ctx *c, uint8_t out[32])
  * 签名输入：salt | uids 原文 | dirs 原文 | argno
  * 刻意用分隔符 '|'，避免 uid 串和目录串拼接后产生歧义。
  */
-/* ---------------- 许可证验证 ---------------- */
+/* ---------------- 许可证验证（Ed25519 非对称） ---------------- */
 
 /*
- * 为什么 KPM 要自己验许可证：
- *   原来只验「参数签名」，而 salt 存在 config.sec 里，解出来就能给任意设备
- *   重算签名；更糟的是不传 sig 直接走「兼容模式」，别人拷走 .kpm 一句
- *   kpatch kpm load 就能用。要让「搬走即用」失效，验证必须发生在内核里，
- *   而且依据必须绑死设备。
+ * 为什么换成非对称签名：
+ *   上一版用 HMAC，key 硬编码在 KPM 里。会反汇编的人能把 key 挖出来，
+ *   然后给自己的设备发卡——「搬走即用」堵死了，但「逆向即用」没堵住。
+ *   现在私钥只在发卡端（Python 脚本），KPM 里只有公钥：逆向 KPM 只能拿到
+ *   公钥，签发不出新卡。
  *
- * 依据是 licverify 签发的 PLQ2 许可证：
- *   PLQ2-<base64url(issued:4 | expires:4 | serial:4 | tag:16)>
- *   tag = HMAC-SHA256(key, "PLQ2\0" | machine[16] | "\0" | fields[12])[:16]
+ * PLQ3 格式（99 字符）：
+ *   PLQ3-<base64url(payload[6] | sig[64])>
+ *   payload = issued_days:u16be | expires_days:u16be | serial:u16be
+ *   msg     = "PLQ3\0" | machine[16] | "\0" | payload[6]
+ *   sig     = Ed25519_sign(私钥, msg)
  *
- * 关键点：machine 是 HMAC 的*输入*，不在许可证里。所以 KPM 用脚本传来的
- * mid 重算 tag——mid 必须是这台设备的真机器码，否则算不出原 tag。
- *   - 拷走 KPM + 模块：他设备的 mid 不同 → tag 不符 → 拒绝
- *   - 拷走你的 license.txt：同上，一样拒绝
- *   - 自己发卡：得先逆向出 KPM 里的 key（提高成本，不是绝对防住）
+ * machine 是签名输入而非输出，KPM 用脚本传来的 mid 重算才能验过——
+ * 换设备的 mid 签名就对不上，拷贝许可证到别的机器无效。
+ *
+ * Ed25519 实现来自 orlp/ed25519（无 libc、无 SIMD），已用 RFC 8032
+ * 官方向量在 x86 与 aarch64 双架构验证通过。
  */
 
-/* 与 licverify 的 lic_key() 完全一致：两半各与垃圾字节异或后拼成 32 字节 */
-static const uint8_t ki_k1[16] = {
-	0x5a, 0x17, 0xc4, 0x91, 0x3e, 0x6d, 0x08, 0xf2,
-	0xb3, 0x4a, 0x77, 0xd9, 0x26, 0x8e, 0x51, 0x0b
+#include "ed25519/ed25519.h"
+
+/* 发卡端公钥（0cb425e5... 的 32 字节），私钥不在设备上 */
+static const uint8_t ki_lic_pubkey[32] = {
+	0x0c, 0xb4, 0x25, 0xe5, 0xa1, 0xe8, 0xaf, 0x28,
+	0x5f, 0x27, 0xd1, 0x87, 0xe0, 0x30, 0xac, 0xfa,
+	0x3f, 0xda, 0xfe, 0xdd, 0xd7, 0x22, 0x92, 0x46,
+	0xa1, 0x45, 0x05, 0xf6, 0x1b, 0x7e, 0xbd, 0xeb
 };
-static const uint8_t ki_kj[8] = {
-	0xaa, 0x55, 0xaa, 0x55, 0x13, 0x37, 0xde, 0xad
-};
-static const uint8_t ki_k2[16] = {
-	0x9c, 0xe0, 0x35, 0x72, 0x4f, 0x1b, 0xa6, 0xd8,
-	0x63, 0x2c, 0x80, 0xf5, 0x09, 0xb7, 0x4e, 0x21
-};
-
-static void ki_lic_key(uint8_t out[32])
-{
-	int i;
-
-	for (i = 0; i < 16; i++)
-		out[i] = (uint8_t)(ki_k1[i] ^ ki_kj[i % 8]);
-	for (i = 0; i < 16; i++)
-		out[16 + i] = (uint8_t)(ki_k2[i] ^ ki_kj[(i + 3) % 8]);
-}
-
-static void ki_hmac_sha256(const uint8_t *key, uint32_t klen,
-			   const uint8_t *msg, uint32_t mlen, uint8_t out[32])
-{
-	struct ki_sha256_ctx c;
-	uint8_t k[64], ip[64], op[64], inner[32];
-	uint32_t i;
-
-	for (i = 0; i < 64; i++)
-		k[i] = 0;
-	if (klen > 64) {
-		ki_sha256_init(&c);
-		ki_sha256_update(&c, key, klen);
-		ki_sha256_final(&c, k);
-	} else {
-		for (i = 0; i < klen; i++)
-			k[i] = key[i];
-	}
-	for (i = 0; i < 64; i++) {
-		ip[i] = (uint8_t)(k[i] ^ 0x36);
-		op[i] = (uint8_t)(k[i] ^ 0x5c);
-	}
-
-	ki_sha256_init(&c);
-	ki_sha256_update(&c, ip, 64);
-	ki_sha256_update(&c, msg, mlen);
-	ki_sha256_final(&c, inner);
-
-	ki_sha256_init(&c);
-	ki_sha256_update(&c, op, 64);
-	ki_sha256_update(&c, inner, 32);
-	ki_sha256_final(&c, out);
-}
 
 static int ki_b64u_val(char ch)
 {
@@ -913,78 +869,52 @@ static int ki_b64u_decode(const char *in, int inlen, uint8_t *out, int outmax)
 }
 
 /*
- * 验证 PLQ2 许可证。
- *   lic / liclen : "PLQ2-<38 字符>"，长度 43
+ * 验证 PLQ3 许可证。
+ *   lic / liclen : "PLQ3-<94 字符>"，总长 99
  *   mid          : 本机机器码，恰好 16 字符
  * 返回 1 通过，0 拒绝。
  */
 static int ki_verify_license(const char *lic, int liclen, const char *mid)
 {
-	uint8_t raw[28], key[32], mac[32], msg[34];
-	uint32_t issued, expires;
+	uint8_t raw[70], msg[25];
+	uint32_t issued_days, expires_days;
 	int i, n;
 
 	if (!lic || !mid)
 		return 0;
-	if (liclen != 43)
+	if (liclen != 99)
 		return 0;
 	if (ki_strlen(mid) != 16)
 		return 0;
 	if (lic[0] != 'P' || lic[1] != 'L' || lic[2] != 'Q' ||
-	    lic[3] != '2' || lic[4] != '-')
+	    lic[3] != '3' || lic[4] != '-')
 		return 0;
 
 	n = ki_b64u_decode(lic + 5, liclen - 5, raw, (int)sizeof(raw));
-	if (n != 28)
+	if (n != 70)
 		return 0;
 
-	/* msg = "PLQ2" + NUL + machine[16] + NUL + fields[12] */
-	msg[0] = 'P'; msg[1] = 'L'; msg[2] = 'Q'; msg[3] = '2'; msg[4] = 0;
+	/* msg = "PLQ3" + NUL + machine[16] + NUL + payload[6] */
+	msg[0] = 'P'; msg[1] = 'L'; msg[2] = 'Q'; msg[3] = '3'; msg[4] = 0;
 	for (i = 0; i < 16; i++)
 		msg[5 + i] = (uint8_t)mid[i];
 	msg[21] = 0;
-	for (i = 0; i < 12; i++)
+	for (i = 0; i < 6; i++)
 		msg[22 + i] = raw[i];
 
-	ki_lic_key(key);
-	ki_hmac_sha256(key, 32, msg, sizeof(msg), mac);
-
-	{
-		uint8_t diff = 0;
-
-		for (i = 0; i < 16; i++)
-			diff |= (uint8_t)(raw[12 + i] ^ mac[i]);
-		if (diff)
-			return 0;
-	}
-
-	issued = ((uint32_t)raw[0] << 24) | ((uint32_t)raw[1] << 16) |
-		 ((uint32_t)raw[2] << 8) | (uint32_t)raw[3];
-	expires = ((uint32_t)raw[4] << 24) | ((uint32_t)raw[5] << 16) |
-		  ((uint32_t)raw[6] << 8) | (uint32_t)raw[7];
-
-	if (!issued)
+	/* ed25519_verify(signature, message, message_len, public_key) */
+	if (!ed25519_verify(raw + 6, msg, sizeof(msg), ki_lic_pubkey))
 		return 0;
-	if (expires && expires < issued)
+
+	issued_days = ((uint32_t)raw[0] << 8) | (uint32_t)raw[1];
+	expires_days = ((uint32_t)raw[2] << 8) | (uint32_t)raw[3];
+
+	if (!issued_days)
+		return 0;
+	if (expires_days && expires_days < issued_days)
 		return 0;
 
 	return 1;
-}
-
-/* 把 uids 串里的每个数字加起来：参数签名之外再加一道，
- * 让「改了 uids 但用旧 sig」在许可证层也过不去（sig 已含 uids，这里是冗余保险）。 */
-static uint64_t ki_uids_fingerprint(const char *uids)
-{
-	uint64_t h = 1469598103934665603ULL;
-	const char *p = uids;
-
-	if (!p)
-		return h;
-	while (*p) {
-		h ^= (uint8_t)*p++;
-		h *= 1099511628211ULL;
-	}
-	return h;
 }
 
 static void ki_sign(const char *salt, const char *uids, const char *dirs,
