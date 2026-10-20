@@ -1,0 +1,51 @@
+﻿name: build-licverify
+
+# 编译 licverify（授权校验器）。纯 libc 依赖，静态链接，aarch64。
+# 与 build-ki-kpm 一样走交叉编译，产物用于替换模块内的 licverify。
+
+on:
+  workflow_dispatch:
+    inputs:
+      src:
+        description: '源码路径'
+        default: 'ki/src/licverify/licverify-serial.c'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装交叉工具链
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          aarch64-linux-gnu-gcc --version | head -1
+
+      - name: 编译
+        run: |
+          set -euo pipefail
+          SRC="${{ inputs.src }}"
+          test -f "$SRC" || { echo "::error::缺源码 $SRC"; exit 1; }
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -static \
+            -o licverify "$SRC" 2>&1 | tee /tmp/build.log
+          ls -l licverify
+          file licverify
+
+      - name: 自检（在 x86 上跑不了，只做静态检查）
+        run: |
+          set -euo pipefail
+          echo "sha256: $(sha256sum licverify | cut -d' ' -f1)"
+          aarch64-linux-gnu-readelf -h licverify | grep -E 'Class|Machine|Type'
+          echo "--- 未定义符号（静态链接后应为空）---"
+          aarch64-linux-gnu-readelf -sW licverify | awk '$7=="UND"{print "  "$8}' | head -10 || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: licverify
+          path: |
+            licverify
+            /tmp/build.log
+          if-no-files-found: error
