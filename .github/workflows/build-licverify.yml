@@ -33,6 +33,9 @@ jobs:
           aarch64-linux-gnu-gcc -O2 -Wall -Wextra -static -I. \
             -o licverify "$SRC" \
             ed25519/verify.c ed25519/fe.c ed25519/ge.c ed25519/sc.c ed25519/sha512.c 2>&1 | tee /tmp/build.log
+          # strip 掉符号表：静态链接的符号信息很大，而且 machine_code / state_key
+          # / hmac_sha256 这些函数名会把内部结构直接告诉逆向者。
+          aarch64-linux-gnu-strip --strip-all licverify
           ls -l licverify
           file licverify
 
