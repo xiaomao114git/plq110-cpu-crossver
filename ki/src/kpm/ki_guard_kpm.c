@@ -852,11 +852,13 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 		(void)l_salt;
 
 		if (v_sig && l_sig > 0) {
-			/* 把 uids/dirs/argno 的原文按长度取出，避免依赖 NUL 结尾 */
-			char b_uids[512], b_dirs[1024], b_argno[8];
+			/* 把 uids/dirs/argno/salt 的原文按长度取出，避免依赖 NUL 结尾。
+			 * 关键：args 是一整条字符串，各键的值指向它内部，后面还接着别的键，
+			 * 直接 ki_strlen 会把后续键也吃进去——salt 就踩过这个坑。 */
+			char b_uids[512], b_dirs[1024], b_argno[8], b_salt[160];
 			int i;
 
-			b_uids[0] = 0; b_dirs[0] = 0; b_argno[0] = 0;
+			b_uids[0] = 0; b_dirs[0] = 0; b_argno[0] = 0; b_salt[0] = 0;
 			if (v_uids) {
 				for (i = 0; i < l_uids && i < 511 && v_uids[i] &&
 					    v_uids[i] != ' ' && v_uids[i] != '\t'; i++)
@@ -875,8 +877,14 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 					b_argno[i] = v_argno[i];
 				b_argno[i] = 0;
 			}
+			if (v_salt) {
+				for (i = 0; i < l_salt && i < 159 && v_salt[i] &&
+					    v_salt[i] != ' ' && v_salt[i] != '\t'; i++)
+					b_salt[i] = v_salt[i];
+				b_salt[i] = 0;
+			}
 
-			if (!ki_verify_sig(v_salt, b_uids, b_dirs, b_argno, v_sig, l_sig)) {
+			if (!ki_verify_sig(b_salt, b_uids, b_dirs, b_argno, v_sig, l_sig)) {
 				/* 调试：把拼接结果和本地算出的哈希打出来，和用户态对照 */
 				{
 					static const char _hx[] = "0123456789abcdef";
@@ -884,14 +892,14 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 					char _hb[65];
 					int _k;
 
-					ki_sign(v_salt, b_uids, b_dirs, b_argno, _m);
+					ki_sign(b_salt, b_uids, b_dirs, b_argno, _m);
 					for (_k = 0; _k < 32; _k++) {
 						_hb[_k * 2] = _hx[_m[_k] >> 4];
 						_hb[_k * 2 + 1] = _hx[_m[_k] & 0xF];
 					}
 					_hb[64] = 0;
 					KI_ERR("drmn: sigdbg uids=[%s] dirs=[%s] argno=[%s] salt=[%s]\n",
-						b_uids, b_dirs, b_argno, v_salt ? v_salt : "");
+						b_uids, b_dirs, b_argno, b_salt);
 					KI_ERR("drmn: sigdbg got=%s\n", _hb);
 					KI_ERR("drmn: sigdbg want=%.64s\n", v_sig);
 				}
