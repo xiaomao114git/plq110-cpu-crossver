@@ -37,6 +37,7 @@ jobs:
           file licverify
 
       - name: 自检（在 x86 上跑不了，只做静态检查）
+        working-directory: ki/src/licverify
         run: |
           set -euo pipefail
           echo "sha256: $(sha256sum licverify | cut -d' ' -f1)"
