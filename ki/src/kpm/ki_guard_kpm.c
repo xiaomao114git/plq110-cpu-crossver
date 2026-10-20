@@ -481,14 +481,25 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 static long ki_control0(const char *args, char *__user out_msg, int outlen)
 {
 	char status[320];
+	int n;
 
 	(void)args;
 
 	ki_fill_status(status, (int)sizeof(status));
 	KI_LOG("drmn: ctl0 %s\n", status);
 
-	if (out_msg && outlen > 0)
-		compat_copy_to_user(out_msg, status, (int)sizeof(status));
+	/*
+	 * 必须按 outlen 截断：kpatch 侧给的用户缓冲通常只有几十到几百字节，
+	 * 直接拷 sizeof(status)=320 会越界，结果就是用户态读到空串
+	 * （实测 kpatch kpm ctl0 输出为空，就是这个原因）。
+	 * 也不拷结尾 NUL —— 让调用方按自己缓冲的大小处理。
+	 */
+	n = (int)strlen(status);
+	if (out_msg && outlen > 0) {
+		if (n > outlen)
+			n = outlen;
+		compat_copy_to_user(out_msg, status, n);
+	}
 
 	return 0;
 }
