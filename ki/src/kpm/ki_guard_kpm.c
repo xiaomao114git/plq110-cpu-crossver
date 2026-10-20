@@ -335,7 +335,14 @@ static void ki_install_supps(void)
 
 /* ---------------- 状态 ---------------- */
 
-static void ki_fill_status(char *out, int outlen)
+/*
+ * 返回实际写入的字符数（不含结尾 NUL）。
+ *
+ * 注意不要在这里用 strlen——KernelPatch 的 linux/string.h 把 strlen 映射成
+ * kf_strlen，而 kpimg 里没有这个符号，符号解析阶段就会失败，整个 KPM 加载不上
+ * （实测 load rc=255，dmesg 里连 init 的日志都没有）。自己数字节最稳。
+ */
+static int ki_fill_status(char *out, int outlen)
 {
 	int n = 0, i;
 
@@ -389,6 +396,8 @@ static void ki_fill_status(char *out, int outlen)
 
 #undef KI_PUTU
 #undef KI_PUTS
+
+	return n;
 }
 
 /* ---------------- 入口 ---------------- */
@@ -485,16 +494,14 @@ static long ki_control0(const char *args, char *__user out_msg, int outlen)
 
 	(void)args;
 
-	ki_fill_status(status, (int)sizeof(status));
+	n = ki_fill_status(status, (int)sizeof(status));
 	KI_LOG("drmn: ctl0 %s\n", status);
 
 	/*
-	 * 必须按 outlen 截断：kpatch 侧给的用户缓冲通常只有几十到几百字节，
-	 * 直接拷 sizeof(status)=320 会越界，结果就是用户态读到空串
-	 * （实测 kpatch kpm ctl0 输出为空，就是这个原因）。
-	 * 也不拷结尾 NUL —— 让调用方按自己缓冲的大小处理。
+	 * 严格按 outlen 截断。上一版这里硬拷 sizeof(status)=320 字节，
+	 * 而 kpatch 侧给的用户缓冲远小于此 —— 越界写导致内核崩（实测重启两次）。
+	 * 现在只拷 min(实际长度, outlen)，且不拷结尾 NUL。
 	 */
-	n = (int)strlen(status);
 	if (out_msg && outlen > 0) {
 		if (n > outlen)
 			n = outlen;
