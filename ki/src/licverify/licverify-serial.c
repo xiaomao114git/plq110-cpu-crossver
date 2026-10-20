@@ -130,19 +130,24 @@ static void sha256_final(sha256_ctx *c, unsigned char out[32])
     }
 }
 
-/* ------------------------------------------------------- HMAC-SHA256(key) */
-/* 密钥不整段出现在二进制里：两半在运行时合成，且中间夹垃圾字节 */
-static const unsigned char K1[16] = { 0x5a,0x17,0xc4,0x91,0x3e,0x6d,0x08,0xf2,
-                                      0xb3,0x4a,0x77,0xd9,0x26,0x8e,0x51,0x0b };
-static const unsigned char KJ[8]  = { 0xaa,0x55,0xaa,0x55,0x13,0x37,0xde,0xad }; /* 垃圾 */
-static const unsigned char K2[16] = { 0x9c,0xe0,0x35,0x72,0x4f,0x1b,0xa6,0xd8,
-                                      0x63,0x2c,0x80,0xf5,0x09,0xb7,0x4e,0x21 };
-
-static size_t lic_key(unsigned char *out /*32*/)
+/* --------------------------------------------------------------------------
+ * state 文件防回滚 MAC 的密钥。
+ *
+ * 注意：这不再是「签发卡密用的密钥」。卡密现在是 PLQ3（Ed25519 非对称），
+ * 客户端只有公钥，签不出卡。这里的密钥只保护 /data/adb/plq110-lic/state，
+ * 也就是防止用户把系统时间往回拨来延长限期卡。即使被逆出来，
+ * 能做的也只有伪造一个「看起来很新」的时间戳，造不出可用卡密。
+ *
+ * 早先这里用的是 K1/K2/KJ 异或出来的 PLQ2 HMAC 密钥，那个密钥能直接签卡，
+ * 所以随 PLQ2 支持一起删掉了。
+ * -------------------------------------------------------------------------- */
+static size_t state_key(unsigned char *out /*32*/)
 {
-    size_t i;
-    for (i = 0; i < 16; i++) out[i] = (unsigned char)(K1[i] ^ KJ[i % 8]);
-    for (i = 0; i < 16; i++) out[16+i] = (unsigned char)(K2[i] ^ KJ[(i + 3) % 8]);
+    static const char salt[] = "plq110-state-mac-v2";
+    sha256_ctx c;
+    sha256_init(&c);
+    sha256_update(&c, (const unsigned char *)salt, sizeof salt - 1);
+    sha256_final(&c, out);
     return 32;
 }
 
@@ -481,52 +486,6 @@ static uint32_t read_u32be(const unsigned char *p)
     return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) | ((uint32_t)p[2] << 8) | p[3];
 }
 
-static int lic_parse_short(struct lic *L, const char *text, int verify_sig, char *err, size_t errsz)
-{
-    char code[44], canonical[48];
-    unsigned char raw[28], msg[34], key[32], want[32];
-    size_t used = 0, klen;
-    uint32_t issued, expires, serial;
-    for (; *text; text++) {
-        unsigned char ch = (unsigned char)*text;
-        if (ch == ' ' || ch == '\t' || ch == '\r' || ch == '\n') continue;
-        if (used >= sizeof code - 1) goto format_error;
-        code[used++] = (char)ch;
-    }
-    code[used] = 0;
-    if (used != 43 || memcmp(code, "PLQ2-", 5) != 0) goto format_error;
-    for (size_t i = 5; i < used; i++) if (b64u_dec_char((unsigned char)code[i]) < 0) goto format_error;
-    if (b64u_decode(code + 5, raw, sizeof raw) != 28) goto format_error;
-    b64u_encode(raw, sizeof raw, canonical, sizeof canonical);
-    if (strcmp(canonical, code + 5) != 0) goto format_error;
-    machine_code(L->dev, sizeof L->dev);
-    if (strlen(L->dev) != 16) {
-        snprintf(err, errsz, "无法取得本机机器码"); return -2;
-    }
-    memcpy(msg, "PLQ2", 5); /* Includes the domain-separating NUL. */
-    memcpy(msg + 5, L->dev, 16);
-    msg[21] = 0;
-    memcpy(msg + 22, raw, 12);
-    klen = lic_key(key);
-    hmac_sha256(key, klen, msg, sizeof msg, want);
-    if (verify_sig) {
-        unsigned char diff = 0;
-        for (size_t i = 0; i < 16; i++) diff |= raw[12 + i] ^ want[i];
-        if (diff) {
-            snprintf(err, errsz, "短卡密无效或与本机不匹配"); return -3;
-        }
-    }
-    issued = read_u32be(raw); expires = read_u32be(raw + 4); serial = read_u32be(raw + 8);
-    if (!issued || (expires && expires < issued)) goto format_error;
-    L->ver = 2; L->iat = (long)issued; L->exp = (long)expires;
-    snprintf(L->uid, sizeof L->uid, "%08X", (unsigned int)serial);
-    snprintf(L->payload, sizeof L->payload, "v=2&dev=%s&iat=%lu&exp=%lu&uid=%s",
-             L->dev, (unsigned long)issued, (unsigned long)expires, L->uid);
-    return 0;
-format_error:
-    snprintf(err, errsz, "短卡密格式错误（应为 PLQ2- 开头的 43 字符单行卡密）");
-    return -3;
-}
 
 /*
  * PLQ3：Ed25519 非对称签名卡密，99 字符。
@@ -603,60 +562,13 @@ format_error:
 
 static int lic_parse(struct lic *L, const char *text, int verify_sig, char *err, size_t errsz)
 {
-    char l1[1024], l2[256];
-    const char *p;
-    unsigned char sig[32], want[32], key[32];
-    size_t klen;
-    long n;
-
     memset(L, 0, sizeof *L);
     while (*text == ' ' || *text == '\t' || *text == '\r' || *text == '\n') text++;
-    if (strncmp(text, "PLQ3-", 5) == 0) return lic_parse_plq3(L, text, verify_sig, err, errsz);
-    if (strncmp(text, "PLQ2-", 5) == 0) return lic_parse_short(L, text, verify_sig, err, errsz);
-    l1[0] = l2[0] = 0;
-    p = text;
-    {
-        size_t i = 0;
-        while (*p && *p != '\n' && *p != '\r' && i < sizeof l1 - 1) l1[i++] = *p++;
-        l1[i] = 0;
-        while (*p == '\n' || *p == '\r') p++;
-        i = 0;
-        while (*p && *p != '\n' && *p != '\r' && i < sizeof l2 - 1) l2[i++] = *p++;
-        l2[i] = 0;
-    }
-    if (strncmp(l1, "PLQ1-", 5) != 0) {
-        snprintf(err, errsz, "卡密格式错误（缺少 PLQ1- 前缀）");
-        return -3;
-    }
-    n = b64u_decode(l1 + 5, (unsigned char *)L->payload, sizeof L->payload - 1);
-    if (n <= 0) { snprintf(err, errsz, "卡密载荷解码失败"); return -3; }
-    L->payload[n] = 0;
-
-    klen = lic_key(key);
-    hmac_sha256(key, klen, L->payload, (size_t)n, want);
-
-    if (verify_sig) {
-        long m = b64u_decode(l2, sig, sizeof sig);
-        if (m != 32) { snprintf(err, errsz, "卡密签名解码失败"); return -3; }
-        {
-            unsigned char diff = 0;
-            size_t i;
-            for (i = 0; i < 32; i++) diff |= (unsigned char)(sig[i] ^ want[i]);
-            if (diff) { snprintf(err, errsz, "卡密签名无效"); return -3; }
-        }
-    }
-
-    {
-        char tmp[64];
-        if (kv_get(L->payload, "v", tmp, sizeof tmp) == 0) L->ver = atoi(tmp); else L->ver = 0;
-        if (kv_get(L->payload, "dev", L->dev, sizeof L->dev) != 0) { snprintf(err, errsz, "卡密缺少 dev"); return -3; }
-        if (kv_get(L->payload, "iat", tmp, sizeof tmp) == 0) L->iat = atol(tmp); else L->iat = 0;
-        if (kv_get(L->payload, "exp", tmp, sizeof tmp) == 0) L->exp = atol(tmp); else L->exp = 0;
-        if (kv_get(L->payload, "uid", L->uid, sizeof L->uid) != 0) L->uid[0] = 0;
-        if (kv_get(L->payload, "note", L->note, sizeof L->note) != 0) L->note[0] = 0;
-    }
-    if (L->ver != 1) { snprintf(err, errsz, "卡密版本不支持: %d", L->ver); return -3; }
-    return 0;
+    /* 只接受 PLQ3。PLQ1/PLQ2 已下线——它们的验签密钥能伪造卡密，不能再带。 */
+    if (strncmp(text, "PLQ3-", 5) == 0)
+        return lic_parse_plq3(L, text, verify_sig, err, errsz);
+    snprintf(err, errsz, "卡密格式错误（只接受 PLQ3- 开头的 99 字符卡密）");
+    return -3;
 }
 
 /* state 文件：seen=<时间戳>&m=<机器码>&k=<MAC(seen|m|key)>&lic=<卡密哈希> */
@@ -675,7 +587,7 @@ static int state_load(long *seen, char *lic_h, size_t lhsz)
     if (kv_get(buf, "m", m, sizeof m) != 0) return -1;
     if (kv_get(buf, "k", k, sizeof k) != 0) return -1;
     kv_get(buf, "lh", lh, sizeof lh);
-    klen = lic_key(key);
+    klen = state_key(key);
     snprintf(msg, sizeof msg, "%s|%s", s, m);
     hmac_sha256(key, klen, msg, strlen(msg), mac);
     {
@@ -696,7 +608,7 @@ static int state_save(long seen, const char *lic_h)
     unsigned char mac[32], key[32];
     size_t klen, i;
     machine_code(m, sizeof m);
-    klen = lic_key(key);
+    klen = state_key(key);
     snprintf(msg, sizeof msg, "%ld|%s", seen, m);
     hmac_sha256(key, klen, msg, strlen(msg), mac);
     for (i = 0; i < 32; i++) sprintf(hex + i*2, "%02x", mac[i]);
@@ -923,9 +835,8 @@ static int cmd_install(const char *srcfile)
         out[q] = 0;
         memcpy(norm, out, q + 1);
     }
-    if (!((lines == 1 && strncmp(norm, "PLQ2-", 5) == 0) ||
-          (lines == 2 && strncmp(norm, "PLQ1-", 5) == 0))) {
-        fprintf(stderr, "需要单行 PLQ2 短卡密或两行 PLQ1 卡密\n"); return 1;
+    if (!(lines == 1 && strncmp(norm, "PLQ3-", 5) == 0)) {
+        fprintf(stderr, "需要单行 PLQ3 短卡密（99 字符）\n"); return 1;
     }
     {
         struct lic candidate;
