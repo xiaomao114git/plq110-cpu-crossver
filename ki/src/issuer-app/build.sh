@@ -15,7 +15,7 @@ echo "platform : $PLAT"
 test -f "$AJ" || { echo "::error::找不到 android.jar"; exit 1; }
 test -x "$BT/aapt2" || { echo "::error::找不到 aapt2"; exit 1; }
 
-rm -rf build && mkdir -p build
+rm -rf build && mkdir -p build/obj build/dex
 
 echo "--- javac ---"
 javac -source 8 -target 8 -encoding UTF-8 \
