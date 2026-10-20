@@ -369,9 +369,14 @@ static void ki_readlink_before(hook_fargs3_t *fargs, void *udata)
 		return;
 
 	p = ki_dentry_path_raw((void *)fargs->arg0, buf, (int)sizeof(buf));
-	if (!p || p != buf)
-		return;   /* ERR_PTR 或路径太长都会被拒绝 */
-	if (!ki_path_is_target(buf))
+	/*
+	 * dentry_path_raw 返回的是 buf 内部的指针，不是 buf 本身 ——
+	 * __dentry_path 从 buf 末尾向前写，返回值指向路径起始处。
+	 * 所以不能判断 p != buf，只能判断它落在 [buf, buf+size) 范围内。
+	 */
+	if (!p || p < buf || p >= buf + sizeof(buf))
+		return;   /* ERR_PTR 或路径超出缓冲 */
+	if (!ki_path_is_target(p))
 		return;
 
 	fargs->skip_origin = 1;
@@ -572,18 +577,30 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 			ki_hooked_lookup = 1;
 	}
 
-	/* 写操作：mkdir / unlink / rmdir —— struct filename* 在 arg1 */
-	addr = kallsyms_lookup_name("do_mkdirat");
-	if (!addr)
-		addr = kallsyms_lookup_name("do_unlinkat");
-	if (!addr)
-		addr = kallsyms_lookup_name("do_rmdir");
-	if (addr) {
-		herr = hook_wrap((void *)addr, 3,
-				 (void *)ki_mutate_before, (void *)0, (void *)0);
-		KI_LOG("drmn: do_mkdirat/unlinkat hook rc=%d\n", (int)herr);
-		if (herr == HOOK_NO_ERR)
-			ki_hooked_mutate = 1;
+	/*
+	 * 写操作：mkdir / unlink / rmdir 是三个独立入口，必须各自 hook。
+	 * 之前写成 kallsyms_lookup_name("do_mkdirat") 失败才去找 unlinkat、
+	 * 再失败才找 rmdir —— 那是"三选一"，do_mkdirat 一存在就再也不 hook
+	 * unlinkat，结果 rm 能穿过（实测 mut_hit 只在 mkdir 时增长）。
+	 */
+	{
+		static const char *const _muts[] = {
+			"do_mkdirat", "do_unlinkat", "do_rmdir"
+		};
+		int _mi;
+
+		for (_mi = 0; _mi < 3; _mi++) {
+			addr = kallsyms_lookup_name(_muts[_mi]);
+			if (!addr) {
+				KI_LOG("drmn: %s 不存在，跳过\n", _muts[_mi]);
+				continue;
+			}
+			herr = hook_wrap((void *)addr, 3,
+					 (void *)ki_mutate_before, (void *)0, (void *)0);
+			KI_LOG("drmn: %s hook rc=%d\n", _muts[_mi], (int)herr);
+			if (herr == HOOK_NO_ERR)
+				ki_hooked_mutate++;
+		}
 	}
 
 	/* 双路径：rename / link —— filename 在 arg1 和 arg3 */
@@ -705,13 +722,17 @@ static long ki_exit(void *__user reserved)
 	}
 
 	if (ki_hooked_mutate) {
-		addr = kallsyms_lookup_name("do_mkdirat");
-		if (!addr)
-			addr = kallsyms_lookup_name("do_unlinkat");
-		if (!addr)
-			addr = kallsyms_lookup_name("do_rmdir");
-		if (addr)
-			unhook((void *)addr);
+		/* 与 init 对称：三个入口各自卸，不能三选一 */
+		static const char *const _muts_x[] = {
+			"do_mkdirat", "do_unlinkat", "do_rmdir"
+		};
+		int _mj;
+
+		for (_mj = 0; _mj < 3; _mj++) {
+			addr = kallsyms_lookup_name(_muts_x[_mj]);
+			if (addr)
+				unhook((void *)addr);
+		}
 		ki_hooked_mutate = 0;
 	}
 	if (ki_hooked_rename) {
