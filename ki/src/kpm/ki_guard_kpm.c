@@ -49,6 +49,7 @@
 #include <linux/printk.h>
 #include <linux/string.h>
 #include <linux/errno.h>
+#include <linux/err.h>
 #include <linux/fs.h>
 #include <asm/current.h>
 
@@ -277,9 +278,12 @@ static int ki_should_block(struct filename *fn)
 		return 0;
 	if (ki_nuids <= 0 || ki_ndirs_want <= 0)
 		return 0;
-	if (!fn || !fn->name)
+	/* filename_lookup accepts ERR_PTR from failed getname operations. */
+	if (IS_ERR_OR_NULL(fn))
 		return 0;
 	if (!ki_uid_hit())
+		return 0;
+	if (IS_ERR_OR_NULL(fn->name))
 		return 0;
 	return ki_path_is_target(fn->name);
 }
@@ -405,6 +409,42 @@ static int ki_hooked_mutate;
 static int ki_hooked_rename;
 static int ki_hooked_symlink;
 static int ki_hooked_readlink;
+
+/* Track only callbacks successfully registered by this module. */
+struct ki_wrap_registration {
+	void *address;
+	void *before;
+	void *after;
+};
+static struct ki_wrap_registration ki_wraps[8];
+static int ki_nwraps;
+
+static hook_err_t ki_register_wrap(void *address, int32_t argno,
+				   void *before, void *after, void *udata)
+{
+	hook_err_t rc;
+	if (ki_nwraps >= 8)
+		return -HOOK_CHAIN_FULL;
+	rc = hook_wrap(address, argno, before, after, udata);
+	if (rc == HOOK_NO_ERR) {
+		ki_wraps[ki_nwraps].address = address;
+		ki_wraps[ki_nwraps].before = before;
+		ki_wraps[ki_nwraps].after = after;
+		ki_nwraps++;
+	}
+	return rc;
+}
+
+static void ki_unregister_wraps(void)
+{
+	while (ki_nwraps > 0) {
+		struct ki_wrap_registration *entry = &ki_wraps[--ki_nwraps];
+		hook_unwrap(entry->address, entry->before, entry->after);
+		entry->address = 0;
+		entry->before = 0;
+		entry->after = 0;
+	}
+}
 
 /* ---------------- 厂商上报压制 ---------------- */
 
@@ -542,6 +582,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	ki_ndirs_want = 0;
 	ki_nsupp_want = 0;
 	ki_nsupp_hooked = 0;
+	ki_nwraps = 0;
 	ki_hits = 0;
 	ki_lookups = 0;
 	ki_mutates = 0;
@@ -589,11 +630,10 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	/* hook do_filp_open：拦 open 族（open=0 可单独关掉，用于二分定位） */
 	if (ki_want_open) {
 		addr = kallsyms_lookup_name("do_filp_open");
-		if (!addr)
-			addr = kallsyms_lookup_name("path_openat");
+
 		KI_LOG("drmn: do_filp_open=%llx\n", (unsigned long long)addr);
 		if (addr) {
-			herr = hook_wrap((void *)addr, 3,
+			herr = ki_register_wrap((void *)addr, 3,
 					 (void *)ki_open_before, (void *)0, (void *)0);
 			KI_LOG("drmn: do_filp_open hook rc=%d\n", (int)herr);
 			if (herr == HOOK_NO_ERR)
@@ -606,11 +646,10 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	/* hook filename_lookup：拦 stat/access 族（lookup=0 可单独关掉） */
 	if (ki_want_lookup) {
 		addr = kallsyms_lookup_name("filename_lookup");
-		if (!addr)
-			addr = kallsyms_lookup_name("path_lookupat");
+
 		KI_LOG("drmn: filename_lookup=%llx\n", (unsigned long long)addr);
 		if (addr) {
-			herr = hook_wrap((void *)addr, 5,
+			herr = ki_register_wrap((void *)addr, 5,
 					 (void *)ki_lookup_before, (void *)0, (void *)0);
 			KI_LOG("drmn: filename_lookup hook rc=%d\n", (int)herr);
 			if (herr == HOOK_NO_ERR)
@@ -648,7 +687,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 				KI_LOG("drmn: %s 不存在，跳过\n", _muts[_mi].name);
 				continue;
 			}
-			herr = hook_wrap((void *)addr, _muts[_mi].argno,
+			herr = ki_register_wrap((void *)addr, _muts[_mi].argno,
 					 (void *)ki_mutate_before, (void *)0, (void *)0);
 			KI_LOG("drmn: %s hook rc=%d (argno=%d)\n",
 			       _muts[_mi].name, (int)herr, _muts[_mi].argno);
@@ -662,7 +701,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	if (!addr)
 		addr = kallsyms_lookup_name("do_linkat");
 	if (addr) {
-		herr = hook_wrap((void *)addr, 5,
+		herr = ki_register_wrap((void *)addr, 5,
 				 (void *)ki_rename_before, (void *)0, (void *)0);
 		KI_LOG("drmn: do_renameat2/linkat hook rc=%d\n", (int)herr);
 		if (herr == HOOK_NO_ERR)
@@ -672,7 +711,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	/* do_symlinkat(from, newdfd, to) —— arg0 和 arg2 */
 	addr = kallsyms_lookup_name("do_symlinkat");
 	if (addr) {
-		herr = hook_wrap((void *)addr, 3,
+		herr = ki_register_wrap((void *)addr, 3,
 				 (void *)ki_symlink_before, (void *)0, (void *)0);
 		KI_LOG("drmn: do_symlinkat hook rc=%d\n", (int)herr);
 		if (herr == HOOK_NO_ERR)
@@ -684,7 +723,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 		kallsyms_lookup_name("dentry_path_raw");
 	addr = kallsyms_lookup_name("vfs_readlink");
 	if (addr && ki_dentry_path_raw) {
-		herr = hook_wrap((void *)addr, 3,
+		herr = ki_register_wrap((void *)addr, 3,
 				 (void *)ki_readlink_before, (void *)0, (void *)0);
 		KI_LOG("drmn: vfs_readlink hook rc=%d\n", (int)herr);
 		if (herr == HOOK_NO_ERR)
@@ -697,6 +736,8 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	}
 
 	if (!ki_hooked_open && !ki_hooked_lookup) {
+		ki_enabled = 0;
+		ki_unregister_wraps();
 		KI_ERR("drmn: 两个主 hook 点都挂不上，无法工作\n");
 		return -EIO;
 	}
@@ -755,63 +796,17 @@ static long ki_control1(void *a1, void *a2, void *a3)
 
 static long ki_exit(void *__user reserved)
 {
-	uint64_t addr;
 	int i;
 
 	(void)reserved;
-
-	if (ki_hooked_open) {
-		addr = kallsyms_lookup_name("do_filp_open");
-		if (!addr)
-			addr = kallsyms_lookup_name("path_openat");
-		if (addr)
-			unhook((void *)addr);
-		ki_hooked_open = 0;
-	}
-
-	if (ki_hooked_lookup) {
-		addr = kallsyms_lookup_name("filename_lookup");
-		if (!addr)
-			addr = kallsyms_lookup_name("path_lookupat");
-		if (addr)
-			unhook((void *)addr);
-		ki_hooked_lookup = 0;
-	}
-
-	if (ki_hooked_mutate) {
-		/* 与 init 对称：三个入口各自卸，不能三选一 */
-		static const char *const _muts_x[] = {
-			"do_mkdirat", "do_unlinkat", "do_rmdir"
-		};
-		int _mj;
-
-		for (_mj = 0; _mj < 3; _mj++) {
-			addr = kallsyms_lookup_name(_muts_x[_mj]);
-			if (addr)
-				unhook((void *)addr);
-		}
-		ki_hooked_mutate = 0;
-	}
-	if (ki_hooked_rename) {
-		addr = kallsyms_lookup_name("do_renameat2");
-		if (!addr)
-			addr = kallsyms_lookup_name("do_linkat");
-		if (addr)
-			unhook((void *)addr);
-		ki_hooked_rename = 0;
-	}
-	if (ki_hooked_symlink) {
-		addr = kallsyms_lookup_name("do_symlinkat");
-		if (addr)
-			unhook((void *)addr);
-		ki_hooked_symlink = 0;
-	}
-	if (ki_hooked_readlink) {
-		addr = kallsyms_lookup_name("vfs_readlink");
-		if (addr)
-			unhook((void *)addr);
-		ki_hooked_readlink = 0;
-	}
+	ki_enabled = 0;
+	ki_unregister_wraps();
+	ki_hooked_open = 0;
+	ki_hooked_lookup = 0;
+	ki_hooked_mutate = 0;
+	ki_hooked_rename = 0;
+	ki_hooked_symlink = 0;
+	ki_hooked_readlink = 0;
 
 	for (i = 0; i < ki_nsupp_hooked; i++) {
 		if (ki_supp_funcs[i])

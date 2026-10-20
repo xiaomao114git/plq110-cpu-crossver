@@ -33,6 +33,12 @@ jobs:
           llvm-strip --version | head -1
           make --version | head -1
 
+      - name: Host stability regression
+        run: |
+          set -euo pipefail
+          python3 ki/tools/test_kpm_stability.py --cc clang \
+            --source ki/src/kpm/ki_guard_kpm.c --output-dir /tmp/kpm-host-tests
+
       - name: 拉 KernelPatch 头文件
         run: |
           set -e
@@ -46,7 +52,7 @@ jobs:
 
       - name: 编译 KPM
         run: |
-          set -e
+          set -euo pipefail
           cd ki/src/kpm
           make KP_DIR="$GITHUB_WORKSPACE/kp" 2>&1 | tee /tmp/build.log
           ls -l msm_drm_notify.kpm
@@ -72,10 +78,21 @@ jobs:
           readelf -sW "$f" | awk '$7=="UND"{print "  " $8}' | head -30
           echo "sha256: $(sha256sum $f | cut -d' ' -f1)"
 
+      - name: Audit kernel register usage
+        run: |
+          set -euo pipefail
+          python3 -m venv /tmp/kpm-audit-venv
+          /tmp/kpm-audit-venv/bin/pip install capstone==5.0.3 pyelftools==0.32
+          /tmp/kpm-audit-venv/bin/python ki/tools/audit_kpm_registers.py --selftest
+          /tmp/kpm-audit-venv/bin/python ki/tools/audit_kpm_registers.py \
+            ki/src/kpm/msm_drm_notify.kpm --output /tmp/kpm-register-audit.json
+
       - uses: actions/upload-artifact@v4
         with:
           name: ki_guard-kpm
           path: |
             ki/src/kpm/msm_drm_notify.kpm
             /tmp/build.log
+            /tmp/kpm-register-audit.json
+            /tmp/kpm-host-tests/result.json
           if-no-files-found: error

@@ -31,7 +31,8 @@ INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/kernel/$(dir))
 CFLAGS := $(INCLUDE_FLAGS) -O2 -Wall \
           -fno-PIC -fno-asynchronous-unwind-tables -fno-stack-protector \
           -fno-unwind-tables -fno-semantic-interposition -U_FORTIFY_SOURCE \
-          -fno-common -fvisibility=hidden
+          -fno-common -fvisibility=hidden \
+          -mgeneral-regs-only -ffixed-x18 -ffreestanding -fno-builtin
 
 OBJS := ki_guard_kpm.o
 
@@ -51,7 +52,7 @@ $(MOD): $(OBJS)
 	$(STRIP) -g --strip-unneeded --strip-debug \
 		--remove-section=.comment --remove-section=.note.GNU-stack $@
 
-ki_guard_kpm.o: ki_guard_kpm.c ki_guard_kpm.lds
+ki_guard_kpm.o: ki_guard_kpm.c ki_guard_kpm.lds Makefile
 	$(CC) $(CFLAGS) -T ki_guard_kpm.lds -c -o $@ $<
 
 clean:
