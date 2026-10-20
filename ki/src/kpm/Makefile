@@ -66,12 +66,19 @@ all: $(MOD)
 # -r 保留重定位，KernelPatch 运行时自己做 relo
 #
 # --localize-hidden 这一步很关键：我们用了 -fvisibility=hidden，但 ld -r 会把
-# 跨编译单元的符号留成 GLOBAL（哪怕它们实际是 HIDDEN 的），于是 ed25519 的
-# fe_mul / ge_frombytes_negate_vartime 这些名字就躺在 .symtab 里，
-# 等于告诉对方「这里用了标准 Ed25519」。先本地化再 strip 就能清掉。
+# 跨编译单元的符号留成 GLOBAL，于是 ed25519 的 fe_mul / ge_frombytes_negate_vartime
+# 这些名字就躺在 .symtab 里，等于告诉对方「这里用了标准 Ed25519」。
+#
+# 实测 --localize-hidden 能清掉 fe_/sc_/sha512_，但 ge_ 的 8 个仍然残留
+# （它们同时被 ge.c 内部和 verify.c 引用，链接后仍是 GLOBAL DEFAULT）。
+# 所以再显式列一遍，保证一个不剩。新增 ge_ 函数时要同步这个列表。
+GE_SYMS := ge_add ge_double_scalarmult_vartime ge_frombytes_negate_vartime \
+           ge_madd ge_msub ge_p2_dbl ge_sub ge_tobytes
+GE_LOCALIZE := $(foreach s,$(GE_SYMS),--localize-symbol=$(s))
+
 $(MOD): $(OBJS)
 	$(CC) -fuse-ld=lld -r -o $@ $^
-	$(OBJCOPY) --localize-hidden $@
+	$(OBJCOPY) --localize-hidden $(GE_LOCALIZE) $@
 	$(STRIP) -g --strip-unneeded --strip-debug \
 		--remove-section=.comment --remove-section=.note.GNU-stack $@
 
