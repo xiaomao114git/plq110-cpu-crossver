@@ -882,20 +882,32 @@ static int ki_verify_license(const char *lic, int liclen, const char *mid)
 	uint8_t raw[70], msg[28];
 	uint32_t issued_days, expires_days;
 	int i, n;
+	int midlen;
 
-	if (!lic || !mid)
+	if (!lic || !mid) {
+		KI_ERR("drmn: [lic] lic 或 mid 为空\n");
 		return 0;
-	if (liclen != 99)
+	}
+	if (liclen != 99) {
+		KI_ERR("drmn: [lic] liclen=%d 应为 99\n", liclen);
 		return 0;
-	if (ki_strlen(mid) != 16)
+	}
+	midlen = ki_strlen(mid);
+	if (midlen != 16) {
+		KI_ERR("drmn: [lic] midlen=%d 应为 16\n", midlen);
 		return 0;
+	}
 	if (lic[0] != 'P' || lic[1] != 'L' || lic[2] != 'Q' ||
-	    lic[3] != '3' || lic[4] != '-')
+	    lic[3] != '3' || lic[4] != '-') {
+		KI_ERR("drmn: [lic] 前缀不是 PLQ3-\n");
 		return 0;
+	}
 
 	n = ki_b64u_decode(lic + 5, liclen - 5, raw, (int)sizeof(raw));
-	if (n != 70)
+	if (n != 70) {
+		KI_ERR("drmn: [lic] b64u 解出 %d 字节，应为 70\n", n);
 		return 0;
+	}
 
 	/* msg = "PLQ3" + NUL + machine[16] + NUL + payload[6] */
 	msg[0] = 'P'; msg[1] = 'L'; msg[2] = 'Q'; msg[3] = '3'; msg[4] = 0;
@@ -906,16 +918,24 @@ static int ki_verify_license(const char *lic, int liclen, const char *mid)
 		msg[22 + i] = raw[i];
 
 	/* ed25519_verify(signature, message, message_len, public_key) */
-	if (!ed25519_verify(raw + 6, msg, sizeof(msg), ki_lic_pubkey))
+	if (!ed25519_verify(raw + 6, msg, sizeof(msg), ki_lic_pubkey)) {
+		KI_ERR("drmn: [lic] ed25519 验签失败 msg0-8=%02x%02x%02x%02x%02x%02x%02x%02x sig0=%02x\n",
+		       msg[0], msg[1], msg[2], msg[3], msg[4], msg[5], msg[6], msg[7],
+		       raw[6]);
 		return 0;
+	}
 
 	issued_days = ((uint32_t)raw[0] << 8) | (uint32_t)raw[1];
 	expires_days = ((uint32_t)raw[2] << 8) | (uint32_t)raw[3];
 
-	if (!issued_days)
+	if (!issued_days) {
+		KI_ERR("drmn: [lic] issued_days=0\n");
 		return 0;
-	if (expires_days && expires_days < issued_days)
+	}
+	if (expires_days && expires_days < issued_days) {
+		KI_ERR("drmn: [lic] expires %u < issued %u\n", expires_days, issued_days);
 		return 0;
+	}
 
 	return 1;
 }
