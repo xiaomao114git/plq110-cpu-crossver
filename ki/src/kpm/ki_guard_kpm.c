@@ -877,6 +877,24 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 			}
 
 			if (!ki_verify_sig(v_salt, b_uids, b_dirs, b_argno, v_sig, l_sig)) {
+				/* 调试：把拼接结果和本地算出的哈希打出来，和用户态对照 */
+				{
+					static const char _hx[] = "0123456789abcdef";
+					uint8_t _m[32];
+					char _hb[65];
+					int _k;
+
+					ki_sign(v_salt, b_uids, b_dirs, b_argno, _m);
+					for (_k = 0; _k < 32; _k++) {
+						_hb[_k * 2] = _hx[_m[_k] >> 4];
+						_hb[_k * 2 + 1] = _hx[_m[_k] & 0xF];
+					}
+					_hb[64] = 0;
+					KI_ERR("drmn: sigdbg uids=[%s] dirs=[%s] argno=[%s] salt=[%s]\n",
+						b_uids, b_dirs, b_argno, v_salt ? v_salt : "");
+					KI_ERR("drmn: sigdbg got=%s\n", _hb);
+					KI_ERR("drmn: sigdbg want=%.64s\n", v_sig);
+				}
 				KI_ERR("drmn: 参数签名不匹配，拒绝加载\n");
 				ki_enabled = 0;
 				return -EACCES;
