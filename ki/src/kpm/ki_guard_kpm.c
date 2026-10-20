@@ -492,15 +492,22 @@ static long ki_control0(const char *args, char *__user out_msg, int outlen)
 	char status[320];
 	int n;
 
-	(void)args;
+	/*
+	 * 这版 kpatch 没有 ctl1 命令，所以把 lock/unlock 合并进 ctl0：
+	 *   kpatch kpm ctl0 <name> toggle   -> 切换拦截开关
+	 *   kpatch kpm ctl0 <name> 任意非空 -> 只读状态
+	 * 注意 CTL_ARGS 必须非空，否则 kpatch 自己就返回 rc=234 了。
+	 * 这里用 args[0]=='t' 判断，避免引入 strcmp 依赖。
+	 */
+	if (args && args[0] == 't' && args[1] == 'o')
+		ki_enabled = !ki_enabled;
 
 	n = ki_fill_status(status, (int)sizeof(status));
-	KI_LOG("drmn: ctl0 %s\n", status);
+	KI_LOG("drmn: ctl0 locked=%d %s\n", ki_enabled, status);
 
 	/*
 	 * 严格按 outlen 截断。上一版这里硬拷 sizeof(status)=320 字节，
 	 * 而 kpatch 侧给的用户缓冲远小于此 —— 越界写导致内核崩（实测重启两次）。
-	 * 现在只拷 min(实际长度, outlen)，且不拷结尾 NUL。
 	 */
 	if (out_msg && outlen > 0) {
 		if (n > outlen)
