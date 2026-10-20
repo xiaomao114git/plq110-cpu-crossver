@@ -111,6 +111,22 @@ static int ki_want_lookup = 1;
 
 /* ---------------- 参数解析 ---------------- */
 
+/*
+ * 不能用 strlen：KernelPatch 的 linux/string.h 把它映射到 kf_strlen，
+ * 而 kpimg 里没有该符号，会在 relo 阶段解析失败导致整包加载不上。
+ * 同理 ki_fill_status 里也是自己数字节。
+ */
+static int ki_strlen(const char *s)
+{
+	int n = 0;
+
+	if (!s)
+		return 0;
+	while (s[n])
+		n++;
+	return n;
+}
+
 static int ki_eq(const char *a, const char *b, int n)
 {
 	int i;
@@ -557,6 +573,191 @@ static int ki_fill_status(char *out, int outlen)
 
 /* ---------------- 入口 ---------------- */
 
+/* ---------------- 参数签名 ---------------- */
+
+/*
+ * 为什么要签名：
+ *   uids / dirs 由用户态脚本解密后传给内核。脚本可以解包，改了再传就是
+ *   另一个目标应用；只在脚本层做文章永远拦不住这一步。把校验搬进内核后，
+ *   改了参数但算不出正确签名，模块直接不挂 hook，拦截不会生效。
+ *
+ * 为什么用 SHA256 而不是简单校验和：
+ *   shell 侧只有 sha256sum 可用（无 openssl，toybox awk 不支持自定义函数），
+ *   内核侧必须能算出同样的值，所以两边都用标准 SHA256。
+ *
+ * salt 从参数传入（来自加密的 config.sec），不是硬编码：这样泄露一个
+ * salt 不会波及所有设备，而且换 salt 不需要重新编译内核模块。
+ */
+
+struct ki_sha256_ctx {
+	uint32_t h[8];
+	uint64_t total;
+	uint32_t buflen;
+	uint8_t buf[64];
+};
+
+static const uint32_t ki_sha256_k[64] = {
+	0x428a2f98, 0x71374491, 0xb5c0fbcf, 0xe9b5dba5, 0x3956c25b, 0x59f111f1, 0x923f82a4, 0xab1c5ed5,
+	0xd807aa98, 0x12835b01, 0x243185be, 0x550c7dc3, 0x72be5d74, 0x80deb1fe, 0x9bdc06a7, 0xc19bf174,
+	0xe49b69c1, 0xefbe4786, 0x0fc19dc6, 0x240ca1cc, 0x2de92c6f, 0x4a7484aa, 0x5cb0a9dc, 0x76f988da,
+	0x983e5152, 0xa831c66d, 0xb00327c8, 0xbf597fc7, 0xc6e00bf3, 0xd5a79147, 0x06ca6351, 0x14292967,
+	0x27b70a85, 0x2e1b2138, 0x4d2c6dfc, 0x53380d13, 0x650a7354, 0x766a0abb, 0x81c2c92e, 0x92722c85,
+	0xa2bfe8a1, 0xa81a664b, 0xc24b8b70, 0xc76c51a3, 0xd192e819, 0xd6990624, 0xf40e3585, 0x106aa070,
+	0x19a4c116, 0x1e376c08, 0x2748774c, 0x34b0bcb5, 0x391c0cb3, 0x4ed8aa4a, 0x5b9cca4f, 0x682e6ff3,
+	0x748f82ee, 0x78a5636f, 0x84c87814, 0x8cc70208, 0x90befffa, 0xa4506ceb, 0xbef9a3f7, 0xc67178f2
+};
+
+#define KI_ROR32(x, n) (((x) >> (n)) | ((x) << (32 - (n))))
+
+static void ki_sha256_block(struct ki_sha256_ctx *c, const uint8_t *p)
+{
+	uint32_t w[64];
+	uint32_t a, b, d, e, f, g, hh, cc;
+	uint32_t s0, s1, t1, t2;
+	int i;
+
+	for (i = 0; i < 16; i++)
+		w[i] = ((uint32_t)p[i * 4] << 24) | ((uint32_t)p[i * 4 + 1] << 16) |
+		       ((uint32_t)p[i * 4 + 2] << 8) | (uint32_t)p[i * 4 + 3];
+	for (i = 16; i < 64; i++) {
+		s0 = KI_ROR32(w[i - 15], 7) ^ KI_ROR32(w[i - 15], 18) ^ (w[i - 15] >> 3);
+		s1 = KI_ROR32(w[i - 2], 17) ^ KI_ROR32(w[i - 2], 19) ^ (w[i - 2] >> 10);
+		w[i] = w[i - 16] + s0 + w[i - 7] + s1;
+	}
+
+	a = c->h[0]; b = c->h[1]; cc = c->h[2]; d = c->h[3];
+	e = c->h[4]; f = c->h[5]; g = c->h[6]; hh = c->h[7];
+
+	for (i = 0; i < 64; i++) {
+		s1 = KI_ROR32(e, 6) ^ KI_ROR32(e, 11) ^ KI_ROR32(e, 25);
+		t1 = hh + s1 + ((e & f) ^ (~e & g)) + ki_sha256_k[i] + w[i];
+		s0 = KI_ROR32(a, 2) ^ KI_ROR32(a, 13) ^ KI_ROR32(a, 22);
+		t2 = s0 + ((a & b) ^ (a & cc) ^ (b & cc));
+		hh = g; g = f; f = e; e = d + t1;
+		d = cc; cc = b; b = a; a = t1 + t2;
+	}
+
+	c->h[0] += a; c->h[1] += b; c->h[2] += cc; c->h[3] += d;
+	c->h[4] += e; c->h[5] += f; c->h[6] += g; c->h[7] += hh;
+}
+
+static void ki_sha256_init(struct ki_sha256_ctx *c)
+{
+	c->h[0] = 0x6a09e667; c->h[1] = 0xbb67ae85;
+	c->h[2] = 0x3c6ef372; c->h[3] = 0xa54ff53a;
+	c->h[4] = 0x510e527f; c->h[5] = 0x9b05688c;
+	c->h[6] = 0x1f83d9ab; c->h[7] = 0x5be0cd19;
+	c->total = 0;
+	c->buflen = 0;
+}
+
+static void ki_sha256_update(struct ki_sha256_ctx *c, const void *data, uint32_t n)
+{
+	const uint8_t *p = (const uint8_t *)data;
+	uint32_t i;
+
+	c->total += n;
+	for (i = 0; i < n; i++) {
+		c->buf[c->buflen++] = p[i];
+		if (c->buflen == 64) {
+			ki_sha256_block(c, c->buf);
+			c->buflen = 0;
+		}
+	}
+}
+
+static void ki_sha256_final(struct ki_sha256_ctx *c, uint8_t out[32])
+{
+	uint64_t bits = c->total * 8;
+	uint8_t pad = 0x80;
+	uint8_t zero = 0;
+	uint8_t lenb[8];
+	int i;
+
+	ki_sha256_update(c, &pad, 1);
+	while (c->buflen != 56)
+		ki_sha256_update(c, &zero, 1);
+	for (i = 0; i < 8; i++)
+		lenb[i] = (uint8_t)(bits >> (56 - i * 8));
+	ki_sha256_update(c, lenb, 8);
+
+	for (i = 0; i < 8; i++) {
+		out[i * 4] = (uint8_t)(c->h[i] >> 24);
+		out[i * 4 + 1] = (uint8_t)(c->h[i] >> 16);
+		out[i * 4 + 2] = (uint8_t)(c->h[i] >> 8);
+		out[i * 4 + 3] = (uint8_t)c->h[i];
+	}
+}
+
+/*
+ * 签名输入：salt | uids 原文 | dirs 原文 | argno
+ * 刻意用分隔符 '|'，避免 uid 串和目录串拼接后产生歧义。
+ */
+static void ki_sign(const char *salt, const char *uids, const char *dirs,
+		    const char *argno, uint8_t out[32])
+{
+	struct ki_sha256_ctx c;
+	uint8_t sep = '|';
+
+	ki_sha256_init(&c);
+	/* 只有 salt 非空才计入，否则用户态传入空 salt 会让两边算法不一致 */
+	if (salt && salt[0]) {
+		ki_sha256_update(&c, salt, (uint32_t)ki_strlen(salt));
+		ki_sha256_update(&c, &sep, 1);
+	}
+	if (uids) {
+		ki_sha256_update(&c, uids, (uint32_t)ki_strlen(uids));
+		ki_sha256_update(&c, &sep, 1);
+	}
+	if (dirs) {
+		ki_sha256_update(&c, dirs, (uint32_t)ki_strlen(dirs));
+		ki_sha256_update(&c, &sep, 1);
+	}
+	if (argno)
+		ki_sha256_update(&c, argno, (uint32_t)ki_strlen(argno));
+	ki_sha256_final(&c, out);
+}
+
+static int ki_hexval(char ch)
+{
+	if (ch >= '0' && ch <= '9')
+		return ch - '0';
+	if (ch >= 'a' && ch <= 'f')
+		return ch - 'a' + 10;
+	if (ch >= 'A' && ch <= 'F')
+		return ch - 'A' + 10;
+	return -1;
+}
+
+/* 期望签名是 hex 字符串；比对前 32 位十六进制（SHA256 全 64 位亦可） */
+static int ki_verify_sig(const char *salt, const char *uids, const char *dirs,
+			 const char *argno, const char *want, int wantlen)
+{
+	static const char hex[] = "0123456789abcdef";
+	uint8_t mac[32];
+	char got[65];
+	int i;
+
+	if (!want || wantlen < 32 || wantlen > 64)
+		return 0;
+
+	ki_sign(salt, uids, dirs, argno, mac);
+	for (i = 0; i < 32; i++) {
+		got[i * 2] = hex[mac[i] >> 4];
+		got[i * 2 + 1] = hex[mac[i] & 0xF];
+	}
+	got[64] = 0;
+
+	for (i = 0; i < wantlen; i++) {
+		int a = ki_hexval(want[i]);
+		int b = ki_hexval(got[i]);
+
+		if (a < 0 || b < 0 || a != b)
+			return 0;
+	}
+	return 1;
+}
+
 static long ki_init(const char *args, const char *event, void *__user reserved)
 {
 	const char *val;
@@ -623,6 +824,64 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	}
 
 	KI_LOG("drmn: uids=%d dirs=%d supp=%d\n", ki_nuids, ki_ndirs_want, ki_nsupp_want);
+
+	/*
+	 * 参数签名校验。
+	 *
+	 * 语义：
+	 *   sig 未提供   -> 兼容模式，跳过校验（便于先验证加载与功能）
+	 *   sig 提供了   -> 必须匹配，否则直接返回错误、一个 hook 都不挂
+	 *
+	 * 校验失败时不"部分工作"，因为部分生效比完全不生效更危险：
+	 * 用户会以为拦截在跑，实际却漏了目标应用。
+	 */
+	{
+		const char *v_uids = 0, *v_dirs = 0, *v_salt = 0, *v_sig = 0, *v_argno = 0;
+		int l_uids = 0, l_dirs = 0, l_sig = 0;
+
+		if (args) {
+			ki_take_value(args, "uids", &v_uids, &l_uids);
+			ki_take_value(args, "dirs", &v_dirs, &l_dirs);
+			ki_take_value(args, "salt", &v_salt, &l_uids);
+			ki_take_value(args, "argno", &v_argno, &l_uids);
+			ki_take_value(args, "sig", &v_sig, &l_sig);
+		}
+
+		if (v_sig && l_sig > 0) {
+			/* 把 uids/dirs/argno 的原文按长度取出，避免依赖 NUL 结尾 */
+			char b_uids[512], b_dirs[1024], b_argno[8];
+			int i;
+
+			b_uids[0] = 0; b_dirs[0] = 0; b_argno[0] = 0;
+			if (v_uids) {
+				for (i = 0; i < l_uids && i < 511 && v_uids[i] &&
+					    v_uids[i] != ' ' && v_uids[i] != '\t'; i++)
+					b_uids[i] = v_uids[i];
+				b_uids[i] = 0;
+			}
+			if (v_dirs) {
+				for (i = 0; i < l_dirs && i < 1023 && v_dirs[i] &&
+					    v_dirs[i] != ' ' && v_dirs[i] != '\t'; i++)
+					b_dirs[i] = v_dirs[i];
+				b_dirs[i] = 0;
+			}
+			if (v_argno) {
+				for (i = 0; i < 7 && v_argno[i] &&
+					    v_argno[i] != ' ' && v_argno[i] != '\t'; i++)
+					b_argno[i] = v_argno[i];
+				b_argno[i] = 0;
+			}
+
+			if (!ki_verify_sig(v_salt, b_uids, b_dirs, b_argno, v_sig, l_sig)) {
+				KI_ERR("drmn: 参数签名不匹配，拒绝加载\n");
+				ki_enabled = 0;
+				return -EACCES;
+			}
+			KI_LOG("drmn: 参数签名校验通过\n");
+		} else {
+			KI_LOG("drmn: 未提供签名（兼容模式，跳过校验）\n");
+		}
+	}
 
 	if (ki_nuids <= 0)
 		KI_LOG("drmn: 没有目标 uid，模块不会做任何事\n");
