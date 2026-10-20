@@ -504,7 +504,16 @@ static void ki_seqopen_before(hook_fargs3_t *fargs, void *udata)
 {
 	(void)udata;
 
-	if (!ki_enabled || !ki_cpu_enabled)
+	/*
+	 * 这里只看 ki_cpu_enabled，不看 ki_enabled。
+	 *
+	 * ki_enabled 是「目录拦截」的运行时开关，由 ctl0 toggle 翻转。CPU 伪装
+	 * 和目录拦截共用同一个 KPM 实例，但它们是两个独立的开关：用户关掉 KI
+	 * 时 KPM 会保留下来继续承担 CPU 伪装（ki_off 的 kpm-cpu 分支）。
+	 * 早先这里也检查 ki_enabled，结果关 KI 会把 CPU 伪装一起停掉——
+	 * 实测表现为「关 KI 后 /proc/cpuinfo 立刻变回真机 8 核」。
+	 */
+	if (!ki_cpu_enabled)
 		return;
 	if (!ki_cpuinfo_text)
 		return;
