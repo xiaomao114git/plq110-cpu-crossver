@@ -69,16 +69,35 @@ all: $(MOD)
 # 跨编译单元的符号留成 GLOBAL，于是 ed25519 的 fe_mul / ge_frombytes_negate_vartime
 # 这些名字就躺在 .symtab 里，等于告诉对方「这里用了标准 Ed25519」。
 #
-# 实测 --localize-hidden 能清掉 fe_/sc_/sha512_，但 ge_ 的 8 个仍然残留
-# （它们同时被 ge.c 内部和 verify.c 引用，链接后仍是 GLOBAL DEFAULT）。
-# 所以再显式列一遍，保证一个不剩。新增 ge_ 函数时要同步这个列表。
-GE_SYMS := ge_add ge_double_scalarmult_vartime ge_frombytes_negate_vartime \
-           ge_madd ge_msub ge_p2_dbl ge_sub ge_tobytes
-GE_LOCALIZE := $(foreach s,$(GE_SYMS),--localize-symbol=$(s))
+# 但只 localize 清不掉 ge_ 那 8 个：它们被 .rela.text 引用，而 ET_REL 的重定位
+# 是按「符号索引」指向 .symtab 条目的 —— KernelPatch 加载时要读 r_info 才能
+# 定位目标符号，所以这些条目删不得。删了重定位就失效。
+#
+# 既然删不掉，就改名：--redefine-sym 保持重定位有效，只把名字换成无意义的。
+# 效果是 .symtab 里再也看不出用了 Ed25519。
+GE_RENAME := \
+    --redefine-sym=ge_add=s_a1 \
+    --redefine-sym=ge_double_scalarmult_vartime=s_a2 \
+    --redefine-sym=ge_frombytes_negate_vartime=s_a3 \
+    --redefine-sym=ge_madd=s_a4 \
+    --redefine-sym=ge_msub=s_a5 \
+    --redefine-sym=ge_p2_dbl=s_a6 \
+    --redefine-sym=ge_sub=s_a7 \
+    --redefine-sym=ge_tobytes=s_a8 \
+    --redefine-sym=ge_p1p1_to_p2=s_a9 \
+    --redefine-sym=ge_p1p1_to_p3=s_a10 \
+    --redefine-sym=ge_p2_0=s_a11 \
+    --redefine-sym=ge_p3_0=s_a12 \
+    --redefine-sym=ge_p3_dbl=s_a13 \
+    --redefine-sym=ge_p3_to_cached=s_a14 \
+    --redefine-sym=ge_p3_to_p2=s_a15 \
+    --redefine-sym=ge_p3_tobytes=s_a16 \
+    --redefine-sym=ge_scalarmult_base=s_a17 \
+    --redefine-sym=ed25519_verify=s_b1
 
 $(MOD): $(OBJS)
 	$(CC) -fuse-ld=lld -r -o $@ $^
-	$(OBJCOPY) --localize-hidden $(GE_LOCALIZE) $@
+	$(OBJCOPY) --localize-hidden $(GE_RENAME) $@
 	$(STRIP) -g --strip-unneeded --strip-debug \
 		--remove-section=.comment --remove-section=.note.GNU-stack $@
 
