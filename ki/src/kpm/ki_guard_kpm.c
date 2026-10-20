@@ -444,15 +444,8 @@ struct ki_seqops {
 	int (*show)(void *m, void *v);
 };
 
-/* struct file / path / dentry / qstr 的固定偏移（64 位） */
-#define KI_OFF_FILE_FPATH      16   /* struct file.f_path */
-#define KI_OFF_PATH_DENTRY     8    /* struct path.dentry */
-#define KI_OFF_DENTRY_DNAME    32   /* struct dentry.d_name */
-#define KI_OFF_QSTR_LEN        4    /* struct qstr: hash(4) + len(4) */
-#define KI_OFF_QSTR_NAME       8    /* struct qstr.name */
-
-/* 内核地址下界：低于此值一律视为无效指针，避免野指针读取 */
-#define KI_KADDR_MIN 0xffff000000000000ULL
+/* 本文件不再读取任何内核结构体成员，全部靠 kallsyms 拿符号地址，
+ * 所以不需要 file/path/dentry/qstr 的偏移常量。 */
 
 static void *(*ki_seq_puts)(void *m, const char *s);
 static struct ki_seqops ki_cpuinfo_ops;
@@ -490,38 +483,22 @@ static int ki_sp_show(void *m, void *v)
 	return 0;
 }
 
-static int ki_is_cpuinfo(uint64_t file)
-{
-	uint64_t dentry, name;
-	uint32_t len;
-	int i;
-
-	if (file < KI_KADDR_MIN)
-		return 0;
-
-	dentry = *(volatile uint64_t *)(file + KI_OFF_FILE_FPATH + KI_OFF_PATH_DENTRY);
-	if (dentry < KI_KADDR_MIN)
-		return 0;
-
-	len = *(volatile uint32_t *)(dentry + KI_OFF_DENTRY_DNAME + KI_OFF_QSTR_LEN);
-	if (len != 7)
-		return 0;
-
-	name = *(volatile uint64_t *)(dentry + KI_OFF_DENTRY_DNAME + KI_OFF_QSTR_NAME);
-	if (name < KI_KADDR_MIN)
-		return 0;
-
-	{
-		const char *p = (const char *)name;
-		static const char want[7] = { 'c', 'p', 'u', 'i', 'n', 'f', 'o' };
-
-		for (i = 0; i < 7; i++) {
-			if (p[i] != want[i])
-				return 0;
-		}
-	}
-	return 1;
-}
+/*
+ * 识别 /proc/cpuinfo 不靠 file 结构体偏移，而是比 seq_open 的第二个参数。
+ *
+ * ARM64 是这样注册的：
+ *     static const struct seq_operations cpuinfo_op = {...};
+ *     proc_create_seq("cpuinfo", 0, NULL, &cpuinfo_op);
+ * 于是 seq_open(file, op) 收到的 op 恒等于 &cpuinfo_op 这个唯一地址。
+ * 直接比指针即可，完全不依赖 struct file/path/dentry/qstr 的任何偏移——
+ * 这才是真正的跨内核。
+ *
+ * 早先按 file->f_path.dentry->d_name 判断的版本实测失败：
+ * cpu_scan 涨到 250 多次而 cpu_hit 恒为 0，说明 f_path 偏移猜错了。
+ * 用符号地址则没有这个风险。
+ */
+static uint64_t ki_cpuinfo_op_addr;
+static uint64_t *ki_cpuinfo_op_p;
 
 static void ki_seqopen_before(hook_fargs3_t *fargs, void *udata)
 {
@@ -533,7 +510,7 @@ static void ki_seqopen_before(hook_fargs3_t *fargs, void *udata)
 		return;
 
 	ki_cpu_scanned++;
-	if (!ki_is_cpuinfo(fargs->arg0))
+	if (!ki_cpuinfo_op_addr || fargs->arg1 != ki_cpuinfo_op_addr)
 		return;
 
 	fargs->arg1 = (uint64_t)&ki_cpuinfo_ops;
@@ -1161,14 +1138,20 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	if (ki_cpu_enabled) {
 		ki_seq_puts = (void *(*)(void *, const char *))
 			kallsyms_lookup_name("seq_puts");
+		ki_cpuinfo_op_addr = kallsyms_lookup_name("cpuinfo_op");
 		ki_cpuinfo_ops.start = (void *(*)(void *, void *))ki_sp_start;
 		ki_cpuinfo_ops.stop = (void (*)(void *, void *))ki_sp_stop;
 		ki_cpuinfo_ops.next = (void *(*)(void *, void *, void *))ki_sp_next;
 		ki_cpuinfo_ops.show = (int (*)(void *, void *))ki_sp_show;
 
-		KI_LOG("drmn: seq_puts=%llx\n", (unsigned long long)(uintptr_t)ki_seq_puts);
+		KI_LOG("drmn: seq_puts=%llx cpuinfo_op=%llx\n",
+		       (unsigned long long)(uintptr_t)ki_seq_puts,
+		       (unsigned long long)ki_cpuinfo_op_addr);
 		if (!ki_seq_puts) {
 			KI_ERR("drmn: 找不到 seq_puts，CPU 伪装无法输出\n");
+			ki_cpu_enabled = 0;
+		} else if (!ki_cpuinfo_op_addr) {
+			KI_ERR("drmn: 找不到 cpuinfo_op，CPU 伪装无法识别目标\n");
 			ki_cpu_enabled = 0;
 		} else {
 			addr = kallsyms_lookup_name("seq_open");
