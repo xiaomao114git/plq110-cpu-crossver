@@ -39,6 +39,7 @@
 #include <linux/string.h>
 #include <linux/errno.h>
 #include <linux/fs.h>
+#include <asm/current.h>
 
 KPM_NAME("msm_drm_notify");
 KPM_VERSION("1.0.0");
@@ -107,13 +108,28 @@ static int ki_enabled = 1;          /* ctl1 切；相当于原版的 lock/unlock
 typedef bool (*ki_filldir_t)(struct dir_context *, const char *, int, loff_t,
 			     u64, unsigned int);
 
-#define KI_MAX_ITER 16
+/*
+ * 槽数必须留够余量：槽满时 ki_iterate_before 会放弃替换 actor，
+ * 那一次 readdir 就不隐藏 —— 目标应用只要同时打开 N 个目录 fd 并发读，
+ * 就能把隐藏绕过去。64 个槽对正常应用足够，也远高于任何"顺手探测"的并发。
+ *
+ * 另外每个槽记下占用它的 task：ctx 是调用方栈上的结构，栈帧复用会让同一
+ * 地址在不同线程间重复出现，只按 ctx 匹配可能把 A 线程的槽误当成 B 线程的。
+ */
+#define KI_MAX_ITER 64
 struct ki_iter_slot {
 	uint64_t ctx;
+	uint64_t task;
 	uint64_t saved;
 	int used;
 };
 static struct ki_iter_slot ki_iter_slots[KI_MAX_ITER];
+static uint64_t ki_iter_overflow;
+
+static uint64_t ki_cur_task(void)
+{
+	return (uint64_t)current;
+}
 
 static uint64_t ki_parent_dentry[KI_MAX_DIRS];
 static char ki_hide_name[KI_MAX_DIRS][64];
@@ -527,12 +543,13 @@ static int ki_name_is_hidden(const char *name, int namelen)
 	return 0;
 }
 
-static int ki_iter_slot_index(uint64_t ctx)
+static int ki_iter_slot_index(uint64_t ctx, uint64_t task)
 {
 	int i;
 
 	for (i = 0; i < KI_MAX_ITER; i++) {
-		if (ki_iter_slots[i].used && ki_iter_slots[i].ctx == ctx)
+		if (ki_iter_slots[i].used && ki_iter_slots[i].ctx == ctx &&
+		    ki_iter_slots[i].task == task)
 			return i;
 	}
 	return -1;
@@ -542,16 +559,23 @@ static bool ki_actor(struct dir_context *ctx, const char *name, int namelen,
 		     loff_t offset, u64 ino, unsigned int d_type)
 {
 	ki_filldir_t saved = (ki_filldir_t)0;
-	int i;
+	int slot;
 
-	for (i = 0; i < KI_MAX_ITER; i++) {
-		if (ki_iter_slots[i].used && ki_iter_slots[i].ctx == (u64)ctx) {
-			saved = (ki_filldir_t)ki_iter_slots[i].saved;
-			break;
-		}
-	}
-	if (!saved)
+	slot = ki_iter_slot_index((u64)ctx, ki_cur_task());
+	if (slot < 0) {
+		/*
+		 * 槽丢了（不该发生）。此时 ctx->actor 仍指向我们，没法转发给
+		 * 原 actor —— 返回 true 让遍历继续、该条目丢失；返回 false 会
+		 * 直接中止遍历。前者影响面更小，所以取 true，同时计数备查。
+		 */
+		ki_iter_overflow++;
 		return true;
+	}
+	saved = (ki_filldir_t)ki_iter_slots[slot].saved;
+	if (!saved) {
+		ki_iter_overflow++;
+		return true;
+	}
 
 	/* 命中要隐藏的项：不转发给原 actor，条目就不会出现在结果里。
 	 * 返回 true 是"继续遍历"，不是"失败"——6.1+ 的 actor 语义。 */
@@ -565,7 +589,7 @@ static void ki_iterate_before(hook_fargs2_t *fargs, void *udata)
 {
 	struct file *file = (struct file *)fargs->arg0;
 	struct dir_context *ctx = (struct dir_context *)fargs->arg1;
-	uint64_t dentry, ctxkey;
+	uint64_t dentry, ctxkey, task;
 	int i, slot = -1;
 
 	(void)udata;
@@ -589,7 +613,8 @@ static void ki_iterate_before(hook_fargs2_t *fargs, void *udata)
 		return;   /* 不是在遍历被隐藏目录的父目录 */
 
 	ctxkey = (uint64_t)ctx;
-	if (ki_iter_slot_index(ctxkey) >= 0)
+	task = ki_cur_task();
+	if (ki_iter_slot_index(ctxkey, task) >= 0)
 		return;   /* 已经换过，别重复包装 */
 
 	for (i = 0; i < KI_MAX_ITER; i++) {
@@ -598,10 +623,17 @@ static void ki_iterate_before(hook_fargs2_t *fargs, void *udata)
 			break;
 		}
 	}
-	if (slot < 0)
+	if (slot < 0) {
+		/*
+		 * 槽满：这一次不替换 actor，readdir 结果里会出现本该隐藏的条目。
+		 * 计数下来，ctl0 能查到 —— 这是隐藏性的真实短板，不该静默。
+		 */
+		ki_iter_overflow++;
 		return;
+	}
 
 	ki_iter_slots[slot].ctx = ctxkey;
+	ki_iter_slots[slot].task = task;
 	ki_iter_slots[slot].saved = (uint64_t)ctx->actor;
 	ki_iter_slots[slot].used = 1;
 	ctx->actor = ki_actor;
@@ -617,13 +649,14 @@ static void ki_iterate_after(hook_fargs2_t *fargs, void *udata)
 	if (!ctx)
 		return;
 
-	slot = ki_iter_slot_index((uint64_t)ctx);
+	slot = ki_iter_slot_index((uint64_t)ctx, ki_cur_task());
 	if (slot < 0)
 		return;
 
 	ctx->actor = (ki_filldir_t)ki_iter_slots[slot].saved;
 	ki_iter_slots[slot].used = 0;
 	ki_iter_slots[slot].ctx = 0;
+	ki_iter_slots[slot].task = 0;
 	ki_iter_slots[slot].saved = 0;
 }
 
@@ -675,6 +708,8 @@ static void ki_fill_status(char *out, int outlen)
 	KI_PUTU(ki_nhide);
 	KI_PUTS(" iter=");
 	KI_PUTU(ki_iter_hooked);
+	KI_PUTS(" itovf=");
+	KI_PUTU(ki_iter_overflow);
 	KI_PUTS(" supp=");
 	KI_PUTU(ki_nsupp_hooked);
 	KI_PUTS("/");
@@ -722,6 +757,7 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	ki_nsupp_hooked = 0;
 	ki_nhide = 0;
 	ki_intercepts = 0;
+	ki_iter_overflow = 0;
 	ki_hooked = 0;
 	ki_iter_hooked = 0;
 	ki_enabled = 1;
@@ -877,6 +913,7 @@ static long ki_exit(void *__user reserved)
 	for (i = 0; i < KI_MAX_ITER; i++) {
 		ki_iter_slots[i].used = 0;
 		ki_iter_slots[i].ctx = 0;
+		ki_iter_slots[i].task = 0;
 		ki_iter_slots[i].saved = 0;
 	}
 
