@@ -1187,11 +1187,14 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 		}
 
 		{
-			char b_lic[64], b_mid[24];
+			/* PLQ3 卡密 99 字符，缓冲必须够。
+			 * 早先是 b_lic[64] 且 i<63，把 99 字符截成 63，
+			 * 表现为「正确卡密也报 liclen=63」——改格式时漏改这里。 */
+			char b_lic[128], b_mid[24];
 			int i;
 
 			b_lic[0] = 0; b_mid[0] = 0;
-			for (i = 0; i < l_lic && i < 63 && v_lic[i] &&
+			for (i = 0; i < l_lic && i < 127 && v_lic[i] &&
 				    v_lic[i] != ' ' && v_lic[i] != '\t'; i++)
 				b_lic[i] = v_lic[i];
 			b_lic[i] = 0;
