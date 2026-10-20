@@ -1064,6 +1064,66 @@ static int ki_hexval(char ch)
 	return -1;
 }
 
+/*
+ * 品牌绑定校验。
+ *
+ * 目的：让「改模块描述/名称」变成「模块直接不工作」，而改的人签不出新签名。
+ *
+ * 做法：ki.sh 把品牌文本和一份 Ed25519 签名一起传进来，KPM 用内置公钥验签。
+ *   msg = "ki-brand-v1\0" | brand_text
+ *   sig = Ed25519_sign(私钥, msg)   ← 私钥只在发卡电脑上
+ *
+ * 失败即拒绝加载（err=51）。买家的可行路径：
+ *   - 改品牌文本 → 签名对不上 → 拒绝
+ *   - 去掉品牌参数 → 缺参数 → 拒绝
+ *   - 换自己的签名 → 没有私钥 → 签不出来
+ *   - 改 KPM 二进制跳过校验 → 需要二进制 patch，成本远高于改脚本
+ *
+ * 注意：这一步也让「KPM 必须由配套脚本加载」成为硬约束——直接
+ * `kpatch kpm load x.kpm "uids=..."` 不带品牌参数是加不上的。
+ */
+static uint8_t ki_brand_sig[64];
+static char ki_brand_txt[64];
+
+static int ki_hex_decode(const char *s, int slen, uint8_t *out, int outmax)
+{
+	int i;
+
+	if (slen != outmax * 2)
+		return 0;
+	for (i = 0; i < outmax; i++) {
+		int hi = ki_hexval(s[i * 2]);
+		int lo = ki_hexval(s[i * 2 + 1]);
+
+		if (hi < 0 || lo < 0)
+			return 0;
+		out[i] = (uint8_t)((hi << 4) | lo);
+	}
+	return 1;
+}
+
+/* 验证品牌签名；brand 为文本，sighex 为 128 个十六进制字符 */
+static int ki_verify_brand(const char *brand, const char *sighex, int siglen)
+{
+	char msg[96];
+	int n = 0, i;
+
+	if (!brand || !sighex)
+		return 0;
+	if (!ki_hex_decode(sighex, siglen, ki_brand_sig, 64))
+		return 0;
+
+	msg[n++] = 'k'; msg[n++] = 'i'; msg[n++] = '-';
+	msg[n++] = 'b'; msg[n++] = 'r'; msg[n++] = 'a';
+	msg[n++] = 'n'; msg[n++] = 'd'; msg[n++] = '-';
+	msg[n++] = 'v'; msg[n++] = '1'; msg[n++] = 0;
+	for (i = 0; brand[i] && n < (int)sizeof(msg) - 1; i++)
+		msg[n++] = brand[i];
+
+	return ed25519_verify(ki_brand_sig, (const unsigned char *)msg, (uint32_t)n,
+			      ki_lic_pubkey);
+}
+
 /* 期望签名是 hex 字符串；比对前 32 位十六进制（SHA256 全 64 位亦可） */
 static int ki_verify_sig(const char *salt, const char *uids, const char *dirs,
 			 const char *argno, const char *want, int wantlen)
@@ -1298,6 +1358,47 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 			}
 			KI_LOG("drmn: 许可证校验通过（mid=%s）\n", b_mid);
 		}
+	}
+
+	/*
+	 * 品牌绑定：bnd= 品牌文本 + bsg= 品牌签名（hex）。
+	 * 缺失或验签失败一律拒绝加载 —— 这样「改模块描述」等于「模块不工作」，
+	 * 而改的人没有私钥，签不出能被 KPM 接受的新签名。
+	 */
+	{
+		const char *v_bnd = 0, *v_bsg = 0;
+		int l_bnd = 0, l_bsg = 0, i;
+
+		if (args) {
+			ki_take_value(args, "bnd", &v_bnd, &l_bnd);
+			ki_take_value(args, "bsg", &v_bsg, &l_bsg);
+		}
+		if (!v_bnd || !v_bsg || l_bnd <= 0 || l_bsg != 128) {
+			KI_ERR("drmn: 缺品牌绑定参数，拒绝加载\n");
+			ki_fail(51);
+			ki_enabled = 0;
+			return -EACCES;
+		}
+		for (i = 0; i < l_bnd && i < 63 && v_bnd[i] &&
+			    v_bnd[i] != ' ' && v_bnd[i] != '\t'; i++)
+			ki_brand_txt[i] = v_bnd[i];
+		ki_brand_txt[i] = 0;
+
+		{
+			char bsg[132];
+
+			for (i = 0; i < 131 && v_bsg[i] &&
+				    v_bsg[i] != ' ' && v_bsg[i] != '\t'; i++)
+				bsg[i] = v_bsg[i];
+			bsg[i] = 0;
+			if (!ki_verify_brand(ki_brand_txt, bsg, i)) {
+				KI_ERR("drmn: 品牌签名无效，拒绝加载\n");
+				ki_fail(52);
+				ki_enabled = 0;
+				return -EACCES;
+			}
+		}
+		KI_LOG("drmn: 品牌绑定校验通过\n");
 	}
 
 	if (ki_nuids <= 0)
