@@ -1,0 +1,58 @@
+name: test-ed25519
+
+# 在 x86 Linux 上跑 RFC 8032 测试向量，证明这份 Ed25519 实现正确。
+# 只有绿了才能把它编进 KPM——内核里的密码学错误无法调试，只能靠事前验证。
+
+on:
+  workflow_dispatch:
+  push:
+    paths:
+      - 'ki/src/kpm/ed25519/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 编译
+        working-directory: ki/src/kpm/ed25519
+        run: |
+          set -euo pipefail
+          gcc -O2 -Wall -Wextra -o test_ed25519 \
+            test_ed25519.c verify.c fe.c ge.c sc.c sha512.c
+          ls -l test_ed25519
+
+      - name: 跑 RFC 8032 向量
+        working-directory: ki/src/kpm/ed25519
+        run: |
+          set -euo pipefail
+          ./test_ed25519 2>&1 | tee /tmp/ed25519-test.log
+
+      - name: 交叉编译到 aarch64（模拟内核目标）
+        working-directory: ki/src/kpm/ed25519
+        run: |
+          set -euo pipefail
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq gcc-aarch64-linux-gnu
+          aarch64-linux-gnu-gcc -O2 -Wall -Wextra -static \
+            -o test_ed25519_arm test_ed25519.c verify.c fe.c ge.c sc.c sha512.c
+          file test_ed25519_arm
+
+      - name: aarch64 用 qemu 跑一遍（若可用）
+        working-directory: ki/src/kpm/ed25519
+        run: |
+          set -euo pipefail
+          if sudo apt-get install -y -qq qemu-user-static >/dev/null 2>&1; then
+            qemu-aarch64-static ./test_ed25519_arm 2>&1 | tee -a /tmp/ed25519-test.log
+          else
+            echo "qemu 不可用，跳过（x86 已验证同一份源码）"
+          fi
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ed25519-test-log
+          path: /tmp/ed25519-test.log
+          if-no-files-found: warn
