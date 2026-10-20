@@ -88,6 +88,8 @@ static uint64_t ki_supp_funcs[KI_MAX_SUPP];
 
 static uint64_t ki_hits;      /* open 侧命中数 */
 static uint64_t ki_lookups;   /* lookup 侧命中数 */
+static uint64_t ki_mutates;   /* mkdir/unlink/rename 等写操作命中数 */
+static uint64_t ki_readlinks; /* readlink 命中数 */
 
 static int ki_enabled = 1;
 
@@ -294,8 +296,95 @@ static void ki_lookup_before(hook_fargs5_t *fargs, void *udata)
 	ki_lookups++;
 }
 
+/*
+ * 写操作：mkdir / unlink / rmdir / symlink 这类只带一个 struct filename* 的，
+ * 参数位置在 arg1（do_mkdirat/do_unlinkat/do_rmdir）。
+ * 实测发现这些原来完全没拦——touch 之所以被拦是因为它内部先做 lookup，
+ * 而 mkdir/unlink 走的是独立的 do_* 入口，不经过 do_filp_open。
+ */
+static void ki_mutate_before(hook_fargs3_t *fargs, void *udata)
+{
+	(void)udata;
+
+	if (!ki_should_block((struct filename *)fargs->arg1))
+		return;
+
+	fargs->skip_origin = 1;
+	fargs->ret = (uint64_t)(long)(-ENOENT);
+	ki_mutates++;
+}
+
+/*
+ * 双路径写操作：do_renameat2(olddfd, from, newdfd, to, flags) 和
+ * do_linkat(olddfd, old, newdfd, new, flags) 都是 5 参数，
+ * 两个 filename 分别在 arg1 和 arg3。任一命中目标就拦。
+ */
+static void ki_rename_before(hook_fargs5_t *fargs, void *udata)
+{
+	(void)udata;
+
+	if (!ki_should_block((struct filename *)fargs->arg1) &&
+	    !ki_should_block((struct filename *)fargs->arg3))
+		return;
+
+	fargs->skip_origin = 1;
+	fargs->ret = (uint64_t)(long)(-ENOENT);
+	ki_mutates++;
+}
+
+/* do_symlinkat(struct filename *from, int newdfd, struct filename *to) */
+static void ki_symlink_before(hook_fargs3_t *fargs, void *udata)
+{
+	(void)udata;
+
+	if (!ki_should_block((struct filename *)fargs->arg0) &&
+	    !ki_should_block((struct filename *)fargs->arg2))
+		return;
+
+	fargs->skip_origin = 1;
+	fargs->ret = (uint64_t)(long)(-ENOENT);
+	ki_mutates++;
+}
+
+/*
+ * vfs_readlink(struct dentry *dentry, char *buffer, int buflen)
+ * 这里没有路径字符串，只有 dentry。用 dentry_path_raw 反查——
+ * 它只需要 dentry，不需要构造 struct path，所以零 BTF 方案也能用。
+ * 注意 dentry_path_raw 是内核符号而非 KernelPatch API，必须 kallsyms 取地址。
+ */
+static char *(*ki_dentry_path_raw)(void *dentry, char *buf, int buflen);
+
+static void ki_readlink_before(hook_fargs3_t *fargs, void *udata)
+{
+	char buf[256];
+	char *p;
+
+	(void)udata;
+
+	if (!ki_enabled || ki_nuids <= 0 || ki_ndirs_want <= 0)
+		return;
+	if (!fargs->arg0 || !ki_dentry_path_raw)
+		return;
+	if (!ki_uid_hit())
+		return;
+
+	p = ki_dentry_path_raw((void *)fargs->arg0, buf, (int)sizeof(buf));
+	if (!p || p != buf)
+		return;   /* ERR_PTR 或路径太长都会被拒绝 */
+	if (!ki_path_is_target(buf))
+		return;
+
+	fargs->skip_origin = 1;
+	fargs->ret = (uint64_t)(long)(-ENOENT);
+	ki_readlinks++;
+}
+
 static int ki_hooked_open;
 static int ki_hooked_lookup;
+static int ki_hooked_mutate;
+static int ki_hooked_rename;
+static int ki_hooked_symlink;
+static int ki_hooked_readlink;
 
 /* ---------------- 厂商上报压制 ---------------- */
 
@@ -392,6 +481,10 @@ static int ki_fill_status(char *out, int outlen)
 	KI_PUTU(ki_hits);
 	KI_PUTS(" look_hit=");
 	KI_PUTU(ki_lookups);
+	KI_PUTS(" mut_hit=");
+	KI_PUTU(ki_mutates);
+	KI_PUTS(" rl_hit=");
+	KI_PUTU(ki_readlinks);
 	out[n] = '\0';
 
 #undef KI_PUTU
@@ -429,8 +522,14 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 	ki_nsupp_hooked = 0;
 	ki_hits = 0;
 	ki_lookups = 0;
+	ki_mutates = 0;
+	ki_readlinks = 0;
 	ki_hooked_open = 0;
 	ki_hooked_lookup = 0;
+	ki_hooked_mutate = 0;
+	ki_hooked_rename = 0;
+	ki_hooked_symlink = 0;
+	ki_hooked_readlink = 0;
 	ki_enabled = 1;
 
 	if (args && ki_take_value(args, "uids", &val, &len))
@@ -473,8 +572,58 @@ static long ki_init(const char *args, const char *event, void *__user reserved)
 			ki_hooked_lookup = 1;
 	}
 
+	/* 写操作：mkdir / unlink / rmdir —— struct filename* 在 arg1 */
+	addr = kallsyms_lookup_name("do_mkdirat");
+	if (!addr)
+		addr = kallsyms_lookup_name("do_unlinkat");
+	if (!addr)
+		addr = kallsyms_lookup_name("do_rmdir");
+	if (addr) {
+		herr = hook_wrap((void *)addr, 3,
+				 (void *)ki_mutate_before, (void *)0, (void *)0);
+		KI_LOG("drmn: do_mkdirat/unlinkat hook rc=%d\n", (int)herr);
+		if (herr == HOOK_NO_ERR)
+			ki_hooked_mutate = 1;
+	}
+
+	/* 双路径：rename / link —— filename 在 arg1 和 arg3 */
+	addr = kallsyms_lookup_name("do_renameat2");
+	if (!addr)
+		addr = kallsyms_lookup_name("do_linkat");
+	if (addr) {
+		herr = hook_wrap((void *)addr, 5,
+				 (void *)ki_rename_before, (void *)0, (void *)0);
+		KI_LOG("drmn: do_renameat2/linkat hook rc=%d\n", (int)herr);
+		if (herr == HOOK_NO_ERR)
+			ki_hooked_rename = 1;
+	}
+
+	/* do_symlinkat(from, newdfd, to) —— arg0 和 arg2 */
+	addr = kallsyms_lookup_name("do_symlinkat");
+	if (addr) {
+		herr = hook_wrap((void *)addr, 3,
+				 (void *)ki_symlink_before, (void *)0, (void *)0);
+		KI_LOG("drmn: do_symlinkat hook rc=%d\n", (int)herr);
+		if (herr == HOOK_NO_ERR)
+			ki_hooked_symlink = 1;
+	}
+
+	/* readlink：只有 dentry，用 dentry_path_raw 反查路径 */
+	ki_dentry_path_raw = (char *(*)(void *, char *, int))
+		kallsyms_lookup_name("dentry_path_raw");
+	addr = kallsyms_lookup_name("vfs_readlink");
+	if (addr && ki_dentry_path_raw) {
+		herr = hook_wrap((void *)addr, 3,
+				 (void *)ki_readlink_before, (void *)0, (void *)0);
+		KI_LOG("drmn: vfs_readlink hook rc=%d\n", (int)herr);
+		if (herr == HOOK_NO_ERR)
+			ki_hooked_readlink = 1;
+	} else {
+		KI_LOG("drmn: vfs_readlink/dentry_path_raw 缺失，readlink 不拦\n");
+	}
+
 	if (!ki_hooked_open && !ki_hooked_lookup) {
-		KI_ERR("drmn: 两个 hook 点都挂不上，无法工作\n");
+		KI_ERR("drmn: 两个主 hook 点都挂不上，无法工作\n");
 		return -EIO;
 	}
 
@@ -553,6 +702,37 @@ static long ki_exit(void *__user reserved)
 		if (addr)
 			unhook((void *)addr);
 		ki_hooked_lookup = 0;
+	}
+
+	if (ki_hooked_mutate) {
+		addr = kallsyms_lookup_name("do_mkdirat");
+		if (!addr)
+			addr = kallsyms_lookup_name("do_unlinkat");
+		if (!addr)
+			addr = kallsyms_lookup_name("do_rmdir");
+		if (addr)
+			unhook((void *)addr);
+		ki_hooked_mutate = 0;
+	}
+	if (ki_hooked_rename) {
+		addr = kallsyms_lookup_name("do_renameat2");
+		if (!addr)
+			addr = kallsyms_lookup_name("do_linkat");
+		if (addr)
+			unhook((void *)addr);
+		ki_hooked_rename = 0;
+	}
+	if (ki_hooked_symlink) {
+		addr = kallsyms_lookup_name("do_symlinkat");
+		if (addr)
+			unhook((void *)addr);
+		ki_hooked_symlink = 0;
+	}
+	if (ki_hooked_readlink) {
+		addr = kallsyms_lookup_name("vfs_readlink");
+		if (addr)
+			unhook((void *)addr);
+		ki_hooked_readlink = 0;
 	}
 
 	for (i = 0; i < ki_nsupp_hooked; i++) {
