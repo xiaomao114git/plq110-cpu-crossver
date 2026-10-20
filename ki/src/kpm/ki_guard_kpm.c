@@ -53,11 +53,11 @@
 #include <linux/fs.h>
 #include <asm/current.h>
 
-KPM_NAME("msm_drm_notify");
+KPM_NAME("小猫隐藏套件");
 KPM_VERSION("2.0.0");
 KPM_LICENSE("GPL v2");
-KPM_AUTHOR("display");
-KPM_DESCRIPTION("Display panel event notification helper");
+KPM_AUTHOR("小猫");
+KPM_DESCRIPTION("机型/指纹/CPU 伪装 + 目录隐藏");
 
 /*
  * 输出开关：默认 0 —— 加载、挂 hook、卸载全程不写 dmesg。
