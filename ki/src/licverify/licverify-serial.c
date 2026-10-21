@@ -720,8 +720,102 @@ static int lic_check(char *err, size_t errsz, long *out_days)
 }
 
 /* ------------------------------------------------------------- 子命令 */
-static int cmd_id(void)
+
+/*
+ * kpmargs —— 唯一的「授权 → KPM 加载参数」出口。
+ *
+ * 为什么要把这一步搬进二进制：
+ *   以前是 ki.sh 自己读卡密、自己算 sha256(salt|uids|dirs|argno)、自己取机器码，
+ *   然后把拼好的字符串交给 kpatch。问题是这三件事全在 shell 里，而 shell 封包
+ *   是可逆混淆——攻击者还原 ki.sh 就能照着算法自己拼参数，再配上一张通行卡密
+ *   就能绕开脚本层的任何判断。
+ *
+ *   现在改成：只有 lic_check() 通过（卡密 Ed25519 验签 + 机器码匹配 + 状态 MAC）
+ *   才会输出参数串。没有有效授权，脚本连"能加载 KPM 的字符串"都拿不到，
+ *   patch 脚本也变不出 sig 和 mid。
+ *
+ * 参数：
+ *   argv[2]=salt  argv[3]=uids  argv[4]=dirs  argv[5]=argno
+ *   argv[6]=cpu   （可空）      argv[7]=品牌  argv[8]=品牌签名
+ * 输出（单行）：
+ *   uids=… dirs=… argno=… salt=… sig=… lic=… mid=… bnd=… bsg=… [cpu=…]
+ */
+static int cmd_kpmargs(int argc, char **argv)
 {
+    char err[256], mc[64], text[2048], licp[600];
+    char sigbuf[256];
+    unsigned char mac[32];
+    sha256_ctx c;
+    const char *salt, *uids, *dirs, *argno, *cpu, *bnd, *bsg;
+    long days = 0;
+    int i;
+
+    if (argc < 9) {
+        fprintf(stderr, "usage: licverify kpmargs <salt> <uids> <dirs> <argno> <cpu|-> <brand> <bsig>\n");
+        return 2;
+    }
+    salt  = argv[2];
+    uids  = argv[3];
+    dirs  = argv[4];
+    argno = argv[5];
+    cpu   = argv[6];
+    bnd   = argv[7];
+    bsg   = argv[8];
+    if (!strcmp(cpu, "-")) cpu = "";
+
+    /* 1. 授权必须成立。失败时不输出任何东西，脚本无从拼凑。 */
+    if (lic_check(err, sizeof err, &days) != 0) {
+        fprintf(stderr, "%s\n", err);
+        return 1;
+    }
+
+    /* 2. 读出卡密原文（lic_check 已确认它可用） */
+    lic_paths(licp, sizeof licp, NULL, 0);
+    if (read_file(licp, text, sizeof text) <= 0) {
+        fprintf(stderr, "读取授权文件失败\n");
+        return 1;
+    }
+    for (i = 0; text[i]; i++) {
+        if (text[i] == '\n' || text[i] == '\r' || text[i] == ' ' || text[i] == '\t')
+            text[i] = 0;
+        else
+            break;
+    }
+    /* 去掉尾部空白/换行 */
+    {
+        size_t n = strlen(text);
+        while (n && (text[n-1] == '\n' || text[n-1] == '\r' ||
+                     text[n-1] == ' '  || text[n-1] == '\t'))
+            text[--n] = 0;
+    }
+
+    /* 3. 参数签名：sha256(salt|uids|dirs|argno)，与 KPM 侧算法一致 */
+    sha256_init(&c);
+    if (salt && *salt)  { sha256_update(&c, (const unsigned char *)salt, strlen(salt));
+                          sha256_update(&c, (const unsigned char *)"|", 1); }
+    if (uids)           { sha256_update(&c, (const unsigned char *)uids, strlen(uids));
+                          sha256_update(&c, (const unsigned char *)"|", 1); }
+    if (dirs)           { sha256_update(&c, (const unsigned char *)dirs, strlen(dirs));
+                          sha256_update(&c, (const unsigned char *)"|", 1); }
+    if (argno)          { sha256_update(&c, (const unsigned char *)argno, strlen(argno)); }
+    sha256_final(&c, mac);
+    for (i = 0; i < 32; i++) sprintf(sigbuf + i*2, "%02x", mac[i]);
+    sigbuf[64] = 0;
+
+    /* 4. 机器码 */
+    machine_code(mc, sizeof mc);
+
+    /* 5. 一次性输出全部参数 */
+    printf("uids=%s dirs=%s argno=%s salt=%s sig=%s lic=%s mid=%s bnd=%s bsg=%s",
+           uids, dirs, argno, salt ? salt : "", sigbuf, text, mc,
+           bnd ? bnd : "", bsg ? bsg : "");
+    if (cpu && *cpu)
+        printf(" cpu=%s", cpu);
+    printf("\n");
+    return 0;
+}
+
+static int cmd_id(void){
     char mc[64];
     machine_code(mc, sizeof mc);
     printf("%s\n", mc);
@@ -893,6 +987,7 @@ int main(int argc, char **argv)
     if (env && env[0]) snprintf(g_dir, sizeof g_dir, "%s", env);
     mkdir(lic_dir(), 0700);
 
+    if (!strcmp(cmd, "kpmargs"))  return cmd_kpmargs(argc, argv);
     if (!strcmp(cmd, "id"))       return cmd_id();
     if (!strcmp(cmd, "selftest")) return cmd_selftest();
     if (!strcmp(cmd, "info"))     return cmd_info(1);
