@@ -346,19 +346,49 @@ static int read_first_line(const char *path, char *out, size_t outsz)
  * 之所以不再把 devid 放第一位：它是首次运行随机生成的，清除模块数据就重生成，
  * 机器码跟着变，已签发的卡密会集体失效。
  */
+/* 序列号是否「干净」：只允许字母数字，长度 6..32。
+ *
+ * 为什么要这道校验：设备实测 ro.serialno 被改成了 `89'57113`（带单引号），
+ * 而 ro.serialno 是可写属性——伪装层、模块、甚至某些应用都能改它。
+ * 如果不做格式校验，序列号一被改写，机器码就跟着变，已发的卡密全部失效。 */
+static int seed_ok(const char *s)
+{
+    size_t i, n;
+
+    if (!s || !*s) return 0;
+    n = strlen(s);
+    if (n < 6 || n > 32) return 0;
+    if (!strcmp(s, "unknown") || !strcmp(s, "0")) return 0;
+    for (i = 0; i < n; i++) {
+        char c = s[i];
+        if (!((c >= '0' && c <= '9') || (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z')))
+            return 0;
+    }
+    return 1;
+}
+
 static int serial_seed(char *out, size_t outsz)
 {
-    static const char *const props[] = { "ro.serialno", "ro.boot.serialno", "ro.boot.hardware.sku" };
+    /*
+     * 顺序很关键：ro.boot.serialno 由 bootloader 传入，是只读的，
+     * 模块和应用改不动；ro.serialno 会被上层改写，只能当备选。
+     * 早先 ro.serialno 排在第一位，结果它被改成 `89'57113` 之后
+     * 机器码从 3B15CQ00X4C00000 变成 AVGDL3MUHDE5FS3E，已发卡密全废。
+     */
+    static const char *const props[] = {
+        "ro.boot.serialno",      /* 只读，首选 */
+        "ro.serialno",           /* 可写，备选 */
+        "ro.boot.hardware.sku",  /* 有些机型序列号在这 */
+        "ro.serial",
+        "ro.product.serial",
+    };
     char tmp[256];
     size_t i;
 
     for (i = 0; i < sizeof props / sizeof props[0]; i++) {
         tmp[0] = 0;
         get_prop(props[i], tmp, sizeof tmp);
-        if (!tmp[0]) continue;
-        /* 排除明显无效值：空、unknown、全 0、过短 */
-        if (!strcmp(tmp, "unknown") || !strcmp(tmp, "0")) continue;
-        if (strlen(tmp) < 4) continue;
+        if (!seed_ok(tmp)) continue;
         snprintf(out, outsz, "%s", tmp);
         return 0;
     }
@@ -371,9 +401,14 @@ static int device_seed(char *out, size_t outsz)
     FILE *f;
     size_t n;
 
-    if (serial_seed(out, outsz) == 0 && out[0])
-        return 0;
-
+    /*
+     * 顺序：devid 文件 > 只读序列号 > 随机。
+     *
+     * devid 排第一是为了「一次算定、永久不变」：序列号即使后来被伪装层
+     * 或别的模块改写，机器码也不会跟着漂，已发的卡密不会失效。
+     * 老设备没有 devid 时会走序列号分支，算出的值和历史一致，
+     * 然后立刻写盘固化下来。
+     */
     snprintf(p, sizeof p, "%s/devid", lic_dir());
     f = fopen(p, "rb");
     if (f) {
@@ -385,10 +420,18 @@ static int device_seed(char *out, size_t outsz)
             while (out[i] && out[i] != '\n' && out[i] != '\r') i++;
             out[i] = 0;
         }
-        if (out[0]) return 0;
+        if (seed_ok(out)) return 0;
     }
 
-    /* 首次生成：优先用内核 uuid（质量好），失败则用 /dev/urandom */
+    out[0] = 0;
+    if (serial_seed(out, outsz) == 0 && out[0]) {
+        /* 第一次算出来就固化，避免属性被改导致机器码漂移 */
+        mkdir(lic_dir(), 0700);
+        write_file_mode(p, out, 0600);
+        return 0;
+    }
+
+    /* 没有可用序列号：用内核 uuid（质量好），失败则 /dev/urandom */
     out[0] = 0;
     if (read_first_line("/proc/sys/kernel/random/uuid", out, outsz) != 0 || !out[0]) {
         unsigned char rnd[32];
